@@ -19,6 +19,15 @@
 
 set -e
 
+# ── Auto-relaunch inside tmux if not already inside a session ─────────────────
+if [ -z "$TMUX" ]; then
+    SESSION="bonsai-bench"
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$SESSION"
+    tmux send-keys -t "$SESSION" "bash $(realpath "$0") $*" Enter
+    exec tmux attach -t "$SESSION"
+fi
+
 # ── Config ────────────────────────────────────────────────────────────────────
 REQS=10
 ONLY_MODEL=""
@@ -41,7 +50,7 @@ PROMPT_LENGTHS=(256 512 1024 2048)
 GEN_LENGTHS=(128 256 512)
 
 SERVER_BIN="$HOME/Desktop/benchmark-jetson/Bonsai-demo/bin/cuda/llama-server"
-HF_CLI="$HOME/venv/bin/huggingface-cli"
+HF_CLI="$HOME/venv/bin/hf"
 BASE_ARTIFACT=""  # set after arg parsing (may be overridden by --resume)
 TEGRA_PIDFILE="/tmp/bonsai_bench_tegrastats.pid"
 SERVER_PIDFILE="/tmp/bonsai_bench_server.pid"
@@ -52,7 +61,7 @@ REPORT_PY="/tmp/bonsai_report.py"
 # 8B models capped at ctx 1536 (max_prompt=1024+gen=512) — larger KV cache OOMs on Jetson 8GB
 declare -a MODELS=(
     "Bonsai-8B|Q1_0|$HOME/models/bonsai/8B/Bonsai-8B-Q1_0.gguf|Qwen/Qwen3-8B|prism-ml/Bonsai-8B-gguf|Bonsai-8B-Q1_0.gguf|1536"
-    "Ternary-Bonsai-8B|Q2_0|$HOME/models/ternary/8B/Ternary-Bonsai-8B-Q2_0.gguf|Qwen/Qwen3-8B|prism-ml/Ternary-Bonsai-8B-gguf|Ternary-Bonsai-8B-Q2_0.gguf|1536"
+    # "Ternary-Bonsai-8B|Q2_0|$HOME/models/ternary/8B/Ternary-Bonsai-8B-Q2_0.gguf|Qwen/Qwen3-8B|prism-ml/Ternary-Bonsai-8B-gguf|Ternary-Bonsai-8B-Q2_0.gguf|1536"
     "Ternary-Bonsai-4B|Q2_0|$HOME/models/ternary/4B/Ternary-Bonsai-4B-Q2_0.gguf|Qwen/Qwen3-4B|prism-ml/Ternary-Bonsai-4B-gguf|Ternary-Bonsai-4B-Q2_0.gguf|2560"
     "Bonsai-4B|Q1_0|$HOME/models/bonsai/4B/Bonsai-4B-Q1_0.gguf|Qwen/Qwen3-4B|prism-ml/Bonsai-4B-gguf|Bonsai-4B-Q1_0.gguf|2560"
     "Ternary-Bonsai-1.7B|Q2_0|$HOME/models/ternary/1.7B/Ternary-Bonsai-1.7B-Q2_0.gguf|Qwen/Qwen3-1.7B|prism-ml/Ternary-Bonsai-1.7B-gguf|Ternary-Bonsai-1.7B-Q2_0.gguf|2560"
@@ -122,6 +131,9 @@ kill_server() {
     # CUDA/unified memory on Jetson is not released immediately on process exit.
     # Wait for the runtime to drain GPU allocations before the next model loads.
     sleep 12
+    # Compact physical memory pages after each model unload to prevent
+    # fragmentation building up and blocking future large allocations.
+    echo 1 | sudo tee /proc/sys/vm/compact_memory > /dev/null 2>&1 || true
 }
 
 # Check server health; if dead, restart it. Returns 0 if alive/restarted, 1 if unrecoverable.
@@ -142,7 +154,7 @@ ensure_server_alive() {
         -m "$model_path" \
         --host 0.0.0.0 --port 8080 \
         -ngl 99 --parallel 1 -c "$ctx_size" \
-        --no-cache-prompt --cache-ram 0 --reasoning off \
+        --no-cache-prompt --reasoning off \
         >> "$srv_log" 2>&1 &
     echo $! > "$SERVER_PIDFILE"
     log "  [RESTART] PID $(cat $SERVER_PIDFILE) — waiting for HTTP 200..."
@@ -214,8 +226,7 @@ if [ "$SKIP_DOWNLOAD" = 0 ] && [ "$DRY_RUN" = 0 ]; then
             log "Downloading $name from $hf_repo/$hf_file..."
             mkdir -p "$local_dir"
             "$HF_CLI" download "$hf_repo" "$hf_file" \
-                --local-dir "$local_dir" \
-                --local-dir-use-symlinks False
+                --local-dir "$local_dir"
             log "$name → $path"
         fi
     done
@@ -307,12 +318,12 @@ for i in "${!MODEL_NAMES[@]}"; do
     # ── Start server ──────────────────────────────────────────────────────────
     SERVER_LOG="$BASE_ARTIFACT/${MODEL_NAME}-server.log"
     log "Launching llama-server..."
-    log "  $SERVER_BIN -m $MODEL_PATH --host 0.0.0.0 --port 8080 -ngl 99 --parallel 1 -c $MODEL_CTX_SIZE --no-cache-prompt --cache-ram 0"
+    log "  $SERVER_BIN -m $MODEL_PATH --host 0.0.0.0 --port 8080 -ngl 99 --parallel 1 -c $MODEL_CTX_SIZE --no-cache-prompt"
     "$SERVER_BIN" \
         -m "$MODEL_PATH" \
         --host 0.0.0.0 --port 8080 \
         -ngl 99 --parallel 1 -c "$MODEL_CTX_SIZE" \
-        --no-cache-prompt --cache-ram 0 --reasoning off \
+        --no-cache-prompt --reasoning off \
         > "$SERVER_LOG" 2>&1 &
     echo $! > "$SERVER_PIDFILE"
     log "  PID: $(cat $SERVER_PIDFILE)  log: $SERVER_LOG"
@@ -500,7 +511,7 @@ tegra_log   = sys.argv[2]
 timing_log  = sys.argv[3]
 skipped_arg = sys.argv[4] if len(sys.argv) > 4 else ""
 ctx_size    = sys.argv[5] if len(sys.argv) > 5 else "?"
-report_path = os.path.join(os.path.dirname(base_dir), "report.md")
+report_path = os.path.join(base_dir, "report.md")
 
 skipped = [s for s in skipped_arg.split("||") if s] if skipped_arg else []
 
@@ -713,7 +724,7 @@ python3 "$REPORT_PY" \
 
 banner "Done"
 echo "  Artifacts : $BASE_ARTIFACT"
-echo "  Report    : $(dirname $BASE_ARTIFACT)/report.md"
+echo "  Report    : $BASE_ARTIFACT/report.md"
 echo ""
 echo "  Dashboard (optional):"
 echo "    source ~/venv/bin/activate"

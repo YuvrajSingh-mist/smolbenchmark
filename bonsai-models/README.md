@@ -129,9 +129,18 @@ bash benchmark_all_bonsai.sh --only bonsai-1.7b --reqs 5
 
 ### Resume an interrupted run
 
+Always resume inside tmux so the session survives terminal disconnects:
+
 ```bash
-bash benchmark_all_bonsai.sh --resume artifacts/bonsai-all-20260527-0200 --reqs 20
+tmux new-session -d -s bonsai-bench && \
+tmux send-keys -t bonsai-bench "cd ~/Desktop/benchmark-jetson/bonsai-models && \
+bash benchmark_all_bonsai.sh --resume artifacts/bonsai-all-YYYYMMDD-HHMM --power-mode 3 --reqs 20" Enter && \
+tmux attach -t bonsai-bench
 ```
+
+Replace `bonsai-all-YYYYMMDD-HHMM` with the actual artifact folder name. The script detects already-completed combos and skips them automatically.
+
+Detach: `Ctrl+B D` — reattach: `tmux attach -t bonsai-bench`
 
 ### Flags reference
 
