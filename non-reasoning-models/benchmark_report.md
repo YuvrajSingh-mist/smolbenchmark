@@ -1,7 +1,6 @@
 # Tiny LLM Benchmark: Jetson Orin Nano Super 8GB
-## Four Power Modes x Eight Models: llama.cpp / CUDA
-
-**Dates:** 2026-05-25 → 2026-05-28  
+## Benchmark Configuration
+ 
 **Platform:** NVIDIA Jetson Orin Nano Super 8GB  
 **CPU:** 6-core Arm Cortex-A78AE · **GPU:** NVIDIA Ampere (1024 CUDA cores, 32 Tensor cores)  
 **Memory:** 8 GB LPDDR5 shared CPU+GPU · **JetPack:** R36.4.7 (L4T 36.4)  
@@ -66,6 +65,8 @@ Eight tiny non-thinking LLMs were benchmarked across all four Jetson Orin Nano S
 | Power telemetry | `tegrastats` at 500 ms, [`VDD_CPU_GPU_CV`](#glossary) rail (mW) |
 | Python | 3.10 (aiperf-env), pandas, seaborn, matplotlib |
 | Datasets | Synthetic prompts at exact token counts (128, 512, 1024, 2048) generated synthetically via aiperf |
+| Concurrency | **1 user, 1 request at a time** (`--parallel 1`, `--concurrency 1`) — single-user latency and throughput profile only |
+| Batch size | **512 tokens** physical (`-ub` / ubatch, default) · 2048 logical (`-b`, default) for llama.cpp; Ollama default `num_batch` = **512** — neither is explicitly set in this benchmark |
 
 ### 1.3 Models Under Test
 
