@@ -1,406 +1,1100 @@
-# Bonsai Model Family Inference Benchmark
-## Jetson Orin Nano Super 8GB — llama.cpp / CUDA
+# Bonsai LLM Benchmark: Jetson Orin Nano Super 8GB
 
-**Dates:** 2026-05-25 → 2026-05-27  
+
+## Benchmark Configuration
+ 
 **Platform:** NVIDIA Jetson Orin Nano Super 8GB  
 **CPU:** 6-core Arm Cortex-A78AE · **GPU:** NVIDIA Ampere (1024 CUDA cores, 32 Tensor cores)  
 **Memory:** 8 GB LPDDR5 shared CPU+GPU · **JetPack:** R36.4.7 (L4T 36.4)  
-**Backend:** llama.cpp `build-jetson`, CUDA, `-ngl 99` (all layers on GPU)  
-**Runs:** Two full sweeps — **15W** (nvpmodel mode 0, GPU @ 612 MHz) and **MAXN_SUPER** (mode 2, GPU @ 1020 MHz, `jetson_clocks`)  
+**Backend:** llama.cpp CUDA, `-ngl 99` (all layers on GPU), `--no-cache-prompt`  
+**Runs:** Four full sweeps: **7W**, **15W**, **25W**, **MAXN_SUPER**  
 **Sweep:** prompt ∈ {256, 512, 1024, 2048} tok × gen ∈ {128, 256, 512} tok × **20 reqs/combo**  
-**Concurrency:** 1 (single-user) · **Key metric:** **tok/J** = output tok/s ÷ VDD_CPU_GPU_CV (W)
+**Concurrency:** 1 (single-user) 
+· **Key metric:** **output tok/J** = [OSL](#glossary) ÷ ([`avg_power_W`](#glossary) × ([RL](#glossary)\_p50\_s − [TTFT](#glossary)\_p50\_s))
 
----
+
 
 ## Executive Summary
 
-Five of the six planned Bonsai/Ternary-Bonsai model variants were benchmarked across **57 combinations** per run (114 data points total across both power modes) on a Jetson Orin Nano Super 8GB. The sixth model, Ternary-Bonsai-8B, cannot load on JetPack R36.4.7 due to a confirmed NvMap kernel regression blocking contiguous CUDA allocations ≥ 1.9 GB.
+Five Bonsai-family 1-1.53bit LLMs were benchmarked across all four Jetson Orin Nano Super power modes: **7W**, **15W**, **25W**, and **MAXN_SUPER**. Each model ran 12 combinations of prompt × generation length (20 requests per combo) at every power mode where it could load.
 
-**Energy efficiency winner: Bonsai-1.7B** achieves **5.40 tok/J** at 15W and **5.13 tok/J** at MAXN_SUPER (ctx=256, gen=512), drawing just 3.2–5.4 W respectively. It is the most power-efficient model across both runs.
+**Key finding: 25W is the energy-efficiency sweet spot for all models ≤4B parameters. For Bonsai-8B, 15W and 25W deliver near-identical output tok/J (~1 % difference), making 15W the more power-conservative choice. MAXN costs 10–11 % more energy per token than 25W across every model tested.** 25W delivers *41–48 %* more output tok/s than 15W while maintaining or improving output tok/J for sub-4B models (ctx=2048, gen=256).
 
-**Throughput winner: Ternary-Bonsai-1.7B** peaks at **25.3 tok/s** (15W) and **41.0 tok/s** (MAXN_SUPER), driven by 2-bit ternary weights that map efficiently to Ampere Tensor cores. At MAXN_SUPER it is the first model in the family to crack 40 tok/s on a $250 board.
+**Throughput and efficiency winner at each mode** *(ctx=2048, gen=256, Ternary-Bonsai-1.7B dominates):*
 
-**MAXN_SUPER delivers a consistent ~1.6× throughput gain** across all five models. However, power draw rises 65–83 %, meaning tok/J drops 5–10 % relative to 15W. **15W mode wins on energy efficiency; MAXN wins on speed.**
+<a id="table-1"></a>
+**Table 1: Throughput and efficiency winner at each power mode**
 
-**Largest model that fits: Bonsai-8B** runs cleanly at both modes (9/9 combos, context capped at 1 536 tokens), delivering 10.2 tok/s (15W) → 16.6 tok/s (MAXN) at 5.4–9.9 W.
+| Mode | Fastest model | Output Tok/s | Output Tok/J |
+|------|--------------|-------------:|-------------:|
+| 7W   | Ternary-Bonsai-1.7B | 9.1  | 4.63 |
+| 15W  | Ternary-Bonsai-1.7B | 23.5 | 4.83 |
+| 25W  | Ternary-Bonsai-1.7B | **34.8** | **5.00** |
+| MAXN | Ternary-Bonsai-1.7B | 38.1 | 4.46 |
 
----
+
+**Ternary-Bonsai-8B (Q2_0, ~1.4 GB)** failed at every power mode: OOM in 8 GB unified memory when combined with KV cache and CUDA overhead. All five remaining models have complete data across all four power modes.
+
+> **Raw data** — complete per-cell JSON exports (all metrics, 12 prompt×gen combos × 20 requests) for all four power modes are on Hugging Face: [7W](https://huggingface.co/datasets/YuvrajSingh9886/jetson-bonsai-benchmark-7w) · [15W](https://huggingface.co/datasets/YuvrajSingh9886/jetson-bonsai-benchmark-15w) · [25W](https://huggingface.co/datasets/YuvrajSingh9886/jetson-bonsai-benchmark-25w) · [MAXN](https://huggingface.co/datasets/YuvrajSingh9886/jetson-bonsai-benchmark-maxn). Each dataset includes `profile_export_aiperf.json`, `tegrastats.log`, and per-model server logs.
 
 ## 1. Test Setup
 
 ### 1.1 Hardware
 
+<a id="table-2"></a>
+**Table 2: Hardware configuration**
+
 | Component | Detail |
 |-----------|--------|
 | Board | Jetson Orin Nano Super 8GB (Developer Kit) |
 | CPU | 6× Arm Cortex-A78AE @ up to 1.728 GHz |
-| GPU | NVIDIA Ampere — 1024 CUDA cores, 32 Tensor cores |
+| GPU | NVIDIA Ampere, 1024 CUDA cores, 32 Tensor cores |
 | Memory | 8 GB LPDDR5 204.8 GB/s (unified CPU + GPU) |
-| Storage | NVMe SSD (model weights) |
-| Cooling | Active fan; peak junction temperature 64 °C (15W) / ~68 °C (MAXN) |
+| CMA | 256 MB (contiguous memory pool; depletes across sequential model loads) |
+| Cooling | Active fan; peak junction temperature ≤ 75 °C across all modes |
 
 ### 1.2 Software Stack
+
+<a id="table-3"></a>
+**Table 3: Software stack**
 
 | Layer | Version / Detail |
 |-------|-----------------|
 | OS / JetPack | JetPack R36.4.7 (Ubuntu 22.04, L4T 36.4) |
 | CUDA | 12.6 |
-| llama.cpp | `build-jetson` (CUDA backend, `-ngl 99`) |
-| Inference server | `llama-server` — host `0.0.0.0:8080`, `--parallel 1`, `-c 2560` (1.7B/4B) or `-c 1536` (8B) |
+| llama.cpp | CUDA backend, `-ngl 99`, `--no-cache-prompt --cache-ram 0` |
+| Inference server | `llama-server`: host `0.0.0.0:8080`, `--parallel 1`, `-c 2560` |
 | Load generator | `aiperf` (NVIDIA AI Performance tool) |
-| Power telemetry | `tegrastats` at 1 Hz, `VDD_CPU_GPU_CV` rail |
-| Python | 3.10 (venv), pandas, seaborn, matplotlib, numpy |
+| Power telemetry | `tegrastats` at 500 ms, [`VDD_CPU_GPU_CV`](#glossary) rail (mW) |
+| Python | 3.10 (aiperf-env), pandas, seaborn, matplotlib |
+| Datasets | Synthetic prompts at exact token counts (256, 512, 1024, 2048) generated synthetically via aiperf |
+| Concurrency | **1 user, 1 request at a time** (`--parallel 1`, `--concurrency 1`) — single-user latency and throughput profile only |
+| Batch size | **512 tokens** physical (`-ub` / ubatch, default) · 2048 logical (`-b`, default) for llama.cpp |
 
 ### 1.3 Models Under Test
 
-| Model | Quant | Size | Tokenizer | Context Cap |
-|-------|-------|------|-----------|-------------|
-| Bonsai-1.7B | Q1_0 (1-bit) | ~237 MB | Qwen3-1.7B | 2 560 tok |
-| Bonsai-4B | Q1_0 (1-bit) | ~540 MB | Qwen3-4B | 2 560 tok |
-| Bonsai-8B | Q1_0 (1-bit) | ~1.07 GB | Qwen3-8B | 1 536 tok |
-| Ternary-Bonsai-1.7B | Q2_0 (2-bit) | ~300 MB | Qwen3-1.7B | 2 560 tok |
-| Ternary-Bonsai-4B | Q2_0 (2-bit) | ~700 MB | Qwen3-4B | 2 560 tok |
-| Ternary-Bonsai-8B | Q2_0 (2-bit) | ~1.4 GB | Qwen3-8B | — (OOM) |
+<a id="table-4"></a>
+**Table 4: Models under test**
 
-All models use the Qwen3 architecture. Bonsai = 1-bit binary (Q1_0). Ternary-Bonsai = 2-bit ternary (Q2_0, weights ∈ {−1, 0, +1}).
+| Model | Quant | GGUF size | Tokenizer |
+|-------|-------|----------:|-----------|
+| Bonsai-1.7B | Q1_0 | ~237 MB | Qwen/Qwen3-1.7B |
+| Bonsai-4B | Q1_0 | ~540 MB | Qwen/Qwen3-4B |
+| Bonsai-8B | Q1_0 | ~1.1 GB | Qwen/Qwen3-8B |
+| Ternary-Bonsai-1.7B | Q2_0 | ~300 MB | Qwen/Qwen3-1.7B |
+| Ternary-Bonsai-4B | Q2_0 | ~700 MB | Qwen/Qwen3-4B |
+| Ternary-Bonsai-8B | Q2_0 | ~1.4 GB | N/A |
+
+<!-- > **Quantization note:** Bonsai models use **Q1_0** (1-bit) quantization; Ternary-Bonsai models use **Q2_0** (2-bit ternary) quantization. These are ultra-low-bit quantizations trained specifically for the Bonsai weight distribution — not standard GGUF integer quants applied post-hoc. The extra 63 MB of Ternary-Bonsai-1.7B vs Bonsai-1.7B reflects the 2-bit vs 1-bit weight storage overhead. Ternary-Bonsai-8B OOM'd at every power mode; all results use the five surviving models. -->
 
 ### 1.4 Power Modes
 
-| Mode | nvpmodel | GPU clock | CPU clock | EMC |
-|------|----------|-----------|-----------|-----|
-| **15W** | `-m 0` | 612 MHz | 1 190 MHz | 2 133 MHz |
-| **MAXN_SUPER** | `-m 2` + `jetson_clocks` | **1 020 MHz** | **1 728 MHz** | **3 199 MHz** |
+<a id="table-5"></a>
+**Table 5: Power mode configurations**
+
+| Mode | nvpmodel | GPU clock | CPU clock | VDD_CPU_GPU_CV (observed) |
+|------|----------|----------:|----------:|--------------------------:|
+| **7W**   | `-m 3` | ~408 MHz | 960 MHz  | 0.5–2.5 W under load |
+| **15W**  | `-m 0` | ~612 MHz | 1 190 MHz | 3–7 W under load |
+| **25W**  | `-m 1` | ~820 MHz | 1 420 MHz | 4–10 W under load |
+| **MAXN** | `-m 2` + `jetson_clocks` | **1 020 MHz** | **1 728 MHz** | 6–12 W under load |
 
 ### 1.5 Benchmark Methodology
 
-For each model × prompt × gen combo, aiperf sends 20 single-concurrency requests with synthetic prompts at the exact target token count. Power is computed from tegrastats `VDD_CPU_GPU_CV` (milliwatts) averaged over each run's `start_time`/`end_time` window. Tok/J = output tok/s ÷ power (W).
+- For each `model` × `prompt` × `gen combo`, `aiperf` sends 20 single-concurrency requests with synthetic prompts at the exact target token count. 
+- Power is computed from `tegrastats` [`VDD_CPU_GPU_CV`](#glossary) (mW → W) averaged over each run's `start_time`/`end_time` window. [`output_tok_J`](#glossary) = [OSL](#glossary) ÷ ([`avg_power_W`](#glossary) × ([RL](#glossary)\_p50\_s − [TTFT](#glossary)\_p50\_s)) — decode energy only, prefill excluded. 
+- Clocks were locked with `jetson_clocks` at all modes. 
+- Each run's power and clock speed was capped at x W through `nvpmodel` and monitored for thermal stability (no sustained throttling; `junction temp` ≤ 75 °C).
+- **Latency percentile used throughout:** all [TTFT](#glossary), [ITL](#glossary), and request latency ([RL](#glossary)) values reported in charts, tables, and energy calculations use the **p50 (median)** over the 20 requests per combo. The mean is not used for latency because occasional slow requests (GC pause, memory compaction, OS scheduling) inflate it without reflecting typical behaviour. p90 and p99 are available in the raw per-mode report files ([Appendix C](#appendix-c)) for tail-latency analysis.
 
----
+## 2. Results: Charts
 
-## 2. Results — Charts
+All charts use data from all four power modes.
 
-All charts below show **both runs together**: solid lines / left bars = 15W, dashed lines / right bars = MAXN_SUPER.
+### 2.1 Throughput vs Prompt Length
 
-### 2.1 Throughput
+`Output tok/s vs prompt length` at *gen=256* across all models and modes; 25W (orange) consistently leads for models ≤4B:
 
-Output tok/s vs prompt length — MAXN (dashed) sits ~1.6× above 15W (solid) at every point:
+<a id="figure-1"></a>
+**Figure 1: Output tok/s vs prompt length (gen=256, all models and modes)**
 
-![Tok/s vs Prompt gen=128](./charts/1_tok_s_vs_prompt_gen128.png)
+![Tok/s vs Prompt gen=256](../../non-reasoning-models/artifacts/charts/1_tok_s_vs_prompt_gen256.png)
 
-![Tok/s vs Prompt gen=512](./charts/1_tok_s_vs_prompt_gen512.png)
+`Canonical cell` (ctx=2048, gen=256), side-by-side output tok/s and output tok/J bars for all 4 modes:
 
-Tok/s vs power — both modes together. MAXN shifts every model right (more power) and up (more throughput):
+<a id="figure-2"></a>
+**Figure 2: Canonical cell: output tok/s and tok/J side by side (ctx=2048, gen=256)**
 
-![Tok/s vs Power Scatter](./charts/11_tok_s_vs_power_scatter.png)
-
-MAXN_SUPER throughput speedup over 15W — consistent ~1.6× for every model regardless of size or quantization:
-
-![Speedup Ratio](./charts/6_speedup_ratio.png)
+![Canonical Cell Comparison](../../non-reasoning-models/artifacts/charts/11_canonical_cell_comparison_ctx2048_gen256.png)
 
 ---
 
 ### 2.2 Energy Efficiency
 
-Tok/J vs prompt length (gen=512) — 15W holds an edge at every prompt length:
+- `Output Tok/J vs prompt length` at *gen=256*; 25W leads for ≤4B models; 15W and 25W are near-tied for Bonsai-8B:
 
-![Tok/J vs Prompt](./charts/2_tok_j_vs_prompt.png)
+<a id="figure-3"></a>
+**Figure 3: Output tok/J vs prompt length (gen=256, all models and modes)**
 
-Best tok/J per model across both modes — 15W wins everywhere, MAXN is close but consistently lower:
+![Output Tok/J vs Prompt](../../non-reasoning-models/artifacts/charts/2_tok_j_vs_prompt_gen256.png)
 
-![Best Tok/J Bar](./charts/3_best_tok_j_bar.png)
+- `Output Tok/J heatmap` (gen × prompt) for Standard Bonsai models (1.7B, 4B, 8B) at all 4 modes:
 
-Tok/J heatmap — top row = 15W, bottom row = MAXN. The sweet spot (short prompt, long gen) is the same in both modes:
+<a id="figure-4"></a>
+**Figure 4: Output tok/J heatmap: Standard Bonsai models at all 4 power modes (gen × prompt)**
 
-![Tok/J Heatmap](./charts/8_tok_j_heatmap.png)
+![Output Tok/J Heatmap small models](../../non-reasoning-models/artifacts/charts/7a_tok_j_heatmap_small_models.png)
+
+- `Output Tok/J heatmap` for Ternary Bonsai models (1.7B, 4B) at all 4 power modes:
+
+<a id="figure-5"></a>
+**Figure 5: Output tok/J heatmap: Ternary Bonsai models at all 4 power modes (gen × prompt)**
+
+![Output Tok/J Heatmap large models](../../non-reasoning-models/artifacts/charts/7b_tok_j_heatmap_large_models.png)
+
+<!-- - `Bonsai-8B spotlight`: output tok/J at all 4 modes across gen sizes:
+
+<a id="figure-6"></a>
+**Figure 6: Bonsai-8B output tok/J at all 4 power modes across gen lengths**
+
+![Bonsai-8B Output Tok/J Spotlight](../../non-reasoning-models/artifacts/charts/12_smollm2_135m_tok_j_spotlight.png) -->
+
+- `Prefill tok/J` (input tokens per joule of prefill energy) vs prompt length at *gen=256*, how efficiently each mode processes the prompt; higher is better:
+
+<a id="figure-7a"></a>
+**Figure 7a: Prefill tok/J (input tok / J) vs prompt length (gen=256, all models and modes)**
+
+> **Approximation note:** `prefill_tok_J = ISL / (avg_power_W × TTFT_s)` uses the full-run average power as a proxy for prefill-phase power. Tegrastats at 500 ms over a 20-request run cannot isolate prefill from decode power — every sample spans multiple phases. For Bonsai models (memory-bandwidth bound) prefill and decode draw similar power, making this a reasonable proxy. See [Appendix J.5](#appendix-j5).
+
+![Prefill tok/J vs prompt gen=256](../../non-reasoning-models/artifacts/charts/22e_prefill_tokj_vs_prompt_gen256.png)
+
+- `Decode tok/J` (output tokens per joule of decode energy) vs prompt length at *gen=256*, output generation efficiency; 25W leads for sub-4B models:
+
+<a id="figure-7b"></a>
+**Figure 7b: Decode tok/J (output tok / J) vs prompt length (gen=256, all models and modes)**
+
+![Decode tok/J vs prompt gen=256](../../non-reasoning-models/artifacts/charts/22f_decode_tokj_vs_prompt_gen256.png)
+
+- `Total tok/J` ((input + output) tokens per joule of total request energy) vs prompt length at *gen=256*, overall request efficiency; 25W wins for sub-4B models at every prompt length:
+
+<a id="figure-7c"></a>
+**Figure 7c: Total tok/J (input+output tok / J) vs prompt length (gen=256, all models and modes)**
+
+![Total tok/J vs prompt gen=256](../../non-reasoning-models/artifacts/charts/22g_total_tokj_vs_prompt_gen256.png)
+
+> Full tok/J charts for all ctx/gen combinations: [F.1 Prefill](#appendix-f1) · [F.2 Decode](#appendix-f2) · [F.3 Total](#appendix-f3).
 
 ---
 
 ### 2.3 Latency
 
-TTFT vs prompt — all models, solid = 15W, dashed = MAXN (gen=128). MAXN cuts TTFT by ~38 %:
+[TTFT](#glossary) p50 at ctx=2048, gen=256; 25W and MAXN reduce TTFT by *29–39 %* vs 15W:
 
-![TTFT vs Prompt](./charts/5_ttft_vs_prompt.png)
+<a id="figure-8"></a>
+**Figure 8: [TTFT](#glossary) p50 by power mode (ctx=2048, gen=256)**
 
-TTFT avg vs p99 spread — shaded band shows avg-to-p99 gap for each mode:
+![TTFT vs Prompt](../../non-reasoning-models/artifacts/charts/5_ttft_vs_prompt.png)
 
-![TTFT Spread](./charts/7_ttft_spread.png)
+[`ITL`](#glossary) *(inter-token latency)* p50 at ctx=2048, gen=256; lower is better:
 
-Inter-token latency — MAXN reduces ITL by ~38 % at every model:
+<a id="figure-9"></a>
+**Figure 9: [ITL](#glossary) p50 by power mode (ctx=2048, gen=256)**
 
-![ITL Comparison](./charts/9_itl_compare.png)
+![ITL Comparison](../../non-reasoning-models/artifacts/charts/8_itl_compare.png)
 
-Request latency p99 — full round-trip tail, both modes:
+`Request latency (E2E)` p50 at ctx=2048, gen=256; total time from request start to last token received:
 
-![Request Latency p99](./charts/12_request_latency_p99.png)
+<a id="figure-10"></a>
+**Figure 10: Request latency (E2E) p50 by power mode (ctx=2048, gen=256)**
+
+![Request Latency Comparison](../../non-reasoning-models/artifacts/charts/10_request_latency_compare.png)
 
 ---
 
 ### 2.4 Prefill Throughput
 
-MAXN_SUPER significantly accelerates prompt ingestion, especially for long-context use cases:
+25W and MAXN provide *~29–47 % faster* prefill than 15W:
 
-![Prefill Comparison](./charts/10_prefill_compare.png)
+<a id="figure-11"></a>
+**Figure 11: Prefill throughput by power mode (gen=256, avg over all prompt lengths)**
+
+![Prefill Comparison](../../non-reasoning-models/artifacts/charts/9_prefill_compare.png)
 
 ---
 
 ### 2.5 Power Draw
 
-Average power per model across both runs — MAXN draws 65–83 % more than 15W:
+Average [`VDD_CPU_GPU_CV`](#glossary) per model at each mode:
 
-![Avg Power Bar](./charts/4_avg_power_bar.png)
+<a id="figure-12"></a>
+**Figure 12: Average [`VDD_CPU_GPU_CV`](#glossary) power draw per model at each power mode**
 
----
+![Avg Power Bar](../../non-reasoning-models/artifacts/charts/4_avg_power_bar.png)
+
+<a id="table-6"></a>
+**Table 6: Average power draw per model at each power mode (W, [`VDD_CPU_GPU_CV`](#glossary))**
+
+| Model | 7W | 15W | 25W | MAXN |
+|-------|---:|----:|----:|-----:|
+| Bonsai-1.7B | 1.50 | 3.35 | **4.70** | 5.65 |
+| Bonsai-4B | 1.61 | 3.75 | **5.29** | 6.38 |
+| Bonsai-8B | 2.04 | 5.47 | **7.95** | 9.80 |
+| Ternary-Bonsai-1.7B | 1.93 | 4.79 | **6.81** | 8.47 |
+| Ternary-Bonsai-4B | 1.96 | 5.09 | 7.43 | **9.11** |
+
+> Averages computed over all 12 prompt × gen combos. Bold = highest observed power draw per model row.
 
 ## 3. Analysis
 
-### 3.1 The 1.6× Rule — Consistent Speedup Across All Models
+### 3.1 Higher tok/sec != efficient model (tok/J)
 
-The most striking finding from the dual-mode sweep is how **uniform the MAXN speedup is**. Every model gains 1.59–1.64× throughput at MAXN_SUPER regardless of parameter count or quantization type:
+Tok/s (left half) and tok/J (right half) are intentionally both shown; a faster mode does not always mean a more efficient one.
 
-| Model | 15W tok/s | MAXN tok/s | Speedup | 15W tok/J | MAXN tok/J | Δ tok/J |
-|-------|----------:|-----------:|--------:|----------:|-----------:|--------:|
-| Bonsai-1.7B | 17.40 | 27.63 | **1.59×** | 5.396 | 5.127 | −5.0 % |
-| Bonsai-4B | 9.48 | 15.12 | **1.59×** | 2.636 | 2.479 | −6.0 % |
-| Bonsai-8B | 10.16 | 16.62 | **1.64×** | 1.872 | 1.677 | −10.4 % |
-| Ternary-Bonsai-1.7B | 25.30 | 40.97 | **1.62×** | 5.316 | 4.887 | −8.1 % |
-| Ternary-Bonsai-4B | 11.87 | 19.40 | **1.63×** | 2.347 | 2.142 | −8.7 % |
+- MAXN beats 25W on raw tok/s (+8–11 %) for all models but loses on tok/J (−10–11 %) because its power increase outpaces the throughput gain for *ctx = 2048, gen = 256*.
+- Bonsai-8B is the notable case: 25W and 15W deliver essentially the same tok/J (1.77 vs 1.79), meaning the Bonsai-8B decode is already **memory-bandwidth bound** at 15W — the extra clock headroom at 25W does not translate to proportional throughput gains.
 
-> Measured at ctx=256, gen=512. Numbers at other configs scale proportionally.
+> [`output_tok_J`](#glossary) = [`tok_s`](#glossary) / [`VDD_CPU_GPU_CV`](#glossary) (W), averaged over each aiperf run window.
 
-The GPU clock ratio is 1020 ÷ 612 = **1.667×**. The actual throughput gain (1.59–1.64×) tracks this ratio closely, confirming that these workloads are entirely GPU clock-bound rather than memory-bandwidth-bound.
+<a id="table-7"></a>
+**Table 7: Canonical cell comparison (ctx=2048, gen=256)**
 
-### 3.2 Energy Efficiency — 15W Wins, But Only Just
+| Model | 7W tok/s | 15W tok/s | 25W tok/s | MAXN tok/s | 7W tok/J | 15W tok/J | 25W tok/J | MAXN tok/J | Peak tok/J |
+|-------|--------:|----------:|----------:|-----------:|---------:|----------:|----------:|----------:|:---------:|
+| Bonsai-1.7B | 6.5 | 16.5 | **24.2** | 26.2 | 4.18 | 4.66 | **4.86** | 4.34 | **25W** |
+| Bonsai-4B | 3.5 | 9.2 | **13.5** | 14.6 | 2.06 | 2.34 | **2.41** | 2.14 | **25W** |
+| Bonsai-8B | 3.6 | 9.9 | **14.0** | 15.1 | 1.69 | **1.79** | 1.77 | 1.59 | **15W** |
+| Ternary-Bonsai-1.7B | 9.1 | 23.5 | **34.8** | 38.1 | 4.65 | 4.85 | **5.03** | 4.48 | **25W** |
+| Ternary-Bonsai-4B | 4.1 | 11.4 | **16.9** | 18.7 | 2.12 | 2.23 | **2.26** | 2.03 | **25W** |
 
-At MAXN_SUPER, power draw rises 65–83 % while throughput rises only 60 %. The result: tok/J drops 5–10 % at every model. The 8B model takes the largest hit (−10.4 %) because its power nearly doubles (5.43 W → 9.91 W).
+### 3.2 The 25W Sweet Spot
 
-Crucially, **the order of models by tok/J is identical in both modes** — Bonsai-1.7B leads, Ternary-1.7B follows, the 4Bs are mid-range, and 8B is last. MAXN doesn't change the relative ranking, it just uniformly shifts all values down by ~7 %.
+**25W is the best mode for output tok/J and tok/sec for all sub-4B Bonsai models, and is near-parity for Bonsai-8B.** The arithmetic is:
 
-**Best tok/J per model (both modes):**
+- Going from **15W → 25W**: output tok/s rises *41–48 %* (GPU clock 612 → 820 MHz), while power rises *~38–46 %*. Net output tok/J gain: *+1 to +4 %* for 1.7B–4B models (including Ternary-Bonsai-4B: 2.22 → 2.25); *−1 %* for Bonsai-8B (memory-bandwidth bound, clock gain wiped by power overhead).
+- Going from **25W → MAXN**: output tok/s gains *+8–11 %* (decode is memory-bandwidth bound, not compute bound), while power rises *~20–31 %*. Net output tok/J loss: *−10 to −11 %* across all models.
 
-| Model | Best Tok/J (15W) | Best Tok/J (MAXN) | Config |
-|-------|----------------:|------------------:|--------|
-| Bonsai-1.7B | **5.396** | **5.127** | ctx=256, gen=512 |
-| Ternary-Bonsai-1.7B | **5.316** | **4.887** | ctx=256, gen=512 |
-| Bonsai-4B | **2.636** | **2.479** | ctx=256, gen=512 |
-| Ternary-Bonsai-4B | **2.347** | **2.142** | ctx=256, gen=512 |
-| Bonsai-8B | **1.872** | **1.677** | ctx=256, gen=512 |
+The GPU clock ceiling at 15W (612 MHz) leaves significant decode throughput on the table for sub-8B models. Raising it to 820 MHz at 25W captures most of the available improvement at modest extra power. The final jump to 1020 MHz at MAXN costs disproportionate power for marginal gains.
 
-In every case the optimal configuration is identical: **short prompt, long generation** (ctx=256, gen=512). This is where a single cheap prefill is amortised over the maximum number of decode steps.
+> **Practical recommendation:** Run at **25W** for best balance of speed and efficiency for Bonsai-1.7B and 4B. For **Bonsai-8B**, 15W and 25W are energy-equivalent — prefer 15W to save ~43 % board power. Use MAXN only when minimising latency ([TTFT](#glossary)) matters more than energy (e.g. interactive chat with long prompts).
 
-### 3.3 Ternary vs Bonsai — Speed vs Frugality
 
-Within each parameter size, the Q2_0 ternary models are consistently faster but draw more power:
+### 3.3 Best use cases for each power mode
 
-| Size | Q1_0 tok/s (15W) | Q2_0 tok/s (15W) | Q2_0 speedup | Power difference |
-|------|----------------:|----------------:|-------------:|-----------------|
-| 1.7B | 17.40 | 25.30 | **+45 %** | +4.76 vs 3.22 W (+48 %) |
-| 4B | 9.48 | 11.87 | **+25 %** | +5.05 vs 3.60 W (+40 %) |
+<a id="table-8"></a>
+**Table 8: Recommended power mode by use case**
 
-The ternary (2-bit) weights map better to Ampere's Tensor core INT4/INT8 compute paths than 1-bit binary (Q1_0). Per-token latency for Ternary-1.7B is **38.6 ms** vs **56.6 ms** for Bonsai-1.7B — a 32 % reduction in decode step cost. But because power also rises proportionally, tok/J ends up nearly identical (5.316 vs 5.396 — a 1.5 % gap).
+| Use case | Recommended mode |
+|----------|-----------------|
+| Always-on inference (sub-4B models) | **25W**: best `output tok/J`, `tok/sec`, and low latency, ~45 % faster than 15W |
+| Always-on inference (Bonsai-8B) | **15W**: energy-equivalent to 25W with ~43 % less board power |
+| Interactive chat, real-time response | **MAXN**: highest `prefill tok/sec`, ~35–47 % faster prefill than 15W |
+| Power-constrained / thermally limited | **15W**: 30–45 % less power draw than MAXN |
+| Edge AI / battery/portable deployment | **7W**: all 5 models fit; useful for efficiency research at minimum power |
 
-**Recommendation:** Q2_0 ternary for latency-sensitive interactive workloads; Q1_0 Bonsai for always-on or power-constrained deployments.
+### 3.4 Throughput Speedup Summary
 
-### 3.4 Latency Characteristics
+All figures are mean(p50) across the full prompt × gen sweep (12 combos per model); throughput uses mean(avg tok/s) since aiperf does not report a p50 for tok/s.
 
-**TTFT scales near-linearly with prompt** across both modes. MAXN reduces TTFT by ~38 % at every prompt length:
+<a id="table-9"></a>
+**Table 9: Output throughput speedup ratios - all pairwise mode comparisons**
 
-| Model | TTFT 15W (ctx=256) | TTFT MAXN (ctx=256) | TTFT 15W (ctx=2048) | TTFT MAXN (ctx=2048) |
-|-------|-------------------:|--------------------:|--------------------:|---------------------:|
-| Bonsai-1.7B | 298 ms | ~185 ms | 1 985 ms | ~1 230 ms |
-| Bonsai-4B | 674 ms | ~418 ms | 4 622 ms | ~2 865 ms |
-| Bonsai-8B | 1 124 ms | ~697 ms | (> ctx cap) | — |
-| Ternary-1.7B | 338 ms | ~210 ms | 2 231 ms | ~1 385 ms |
-| Ternary-4B | 786 ms | ~488 ms | 5 280 ms | ~3 275 ms |
+| Model | 25W / 15W | MAXN / 15W | 15W / 7W | 25W / 7W | MAXN / 7W | MAXN / 25W |
+|-------|----------:|-----------:|---------:|---------:|----------:|-----------:|
+| Bonsai-1.7B | 1.47x | 1.59x | 2.56x | 3.76x | 4.06x | 1.08x |
+| Bonsai-4B | 1.47x | 1.59x | 2.65x | 3.90x | 4.21x | 1.08x |
+| Bonsai-8B | 1.46x | 1.61x | **2.78x** | **4.06x** | **4.49x** | 1.11x |
+| Ternary-Bonsai-1.7B | **1.48x** | 1.62x | 2.64x | 3.90x | 4.27x | 1.09x |
+| Ternary-Bonsai-4B | **1.48x** | **1.64x** | **2.78x** | **4.13x** | **4.56x** | **1.10x** |
 
-**Latency consistency is excellent in both modes.** For nearly all configurations, avg-to-p99 TTFT spread is under 15 ms (< 5 % of mean). The only notable outlier is Bonsai-8B at ctx=256/gen=128 in the 15W run: avg 1 124 ms, p99 1 668 ms — a one-off CUDA kernel JIT spike that does not recur.
+- **25W** delivers a consistent *~1.46–1.48x* speedup vs 15W across all models.
+- **15W** gives about *2.5–2.8x* boost vs **7W**; Bonsai-8B and Ternary-4B show the largest gain at 2.78x.
+- **MAXN/25W** is consistently *~1.08–1.10x* for all models — extra compute headroom over an already-fast 25W baseline translates to only modest gains, since decode is memory-bandwidth bound.
+- **MAXN/7W** reaches *4.56x* for **Ternary-Bonsai-4B** — the largest speedup in the sweep. **25W/7W** for Ternary-Bonsai-4B is *4.13x*, the highest 25W gain of any model.
 
-**Prefill throughput increases at longer prompts** for all models (GPU utilisation improves with larger attention batches). At MAXN, Bonsai-1.7B prefills at ~1 600+ tok/s at ctx=2048 vs ~1 030 tok/s at 15W.
+### 3.5 Latency Characteristics
 
-### 3.5 Power Scaling
+**[TTFT](#glossary) scales near-linearly with prompt across all modes.** At ctx=256 a model like Bonsai-1.7B prefills in ~170 ms (25W); at ctx=2048 that grows to ~1353 ms. The 25W / MAXN modes reduce TTFT proportionally to their clock ratio vs 15W.
 
-Actual VDD_CPU_GPU_CV draw per model at best-throughput config:
+**Inter-token latency ([ITL](#glossary)) p50** is the median per-token decode cost. ITL heatmaps per power mode (all 5 models, all 12 prompt×gen combos) are in [**Appendix H.2**](#appendix-h2) — see Figures H.2a–H.2d. At the canonical ctx=2048, gen=256:
 
-| Model | 15W draw | MAXN draw | Ratio |
-|-------|--------:|----------:|------:|
-| Bonsai-1.7B | 3.22 W | 5.39 W | 1.67× |
-| Bonsai-4B | 3.60 W | 6.10 W | 1.69× |
-| Bonsai-8B | 5.43 W | 9.91 W | 1.83× |
-| Ternary-1.7B | 4.76 W | 8.38 W | 1.76× |
-| Ternary-4B | 5.05 W | 9.06 W | 1.79× |
+<a id="figure-10a"></a>
 
-At 15W mode, no model ever came close to the 15 W power envelope cap — meaning the GPU clock (612 MHz) was the binding constraint, not TDP. At MAXN_SUPER, the 8B model drawing ~10 W approaches a practical thermal limit for light active cooling in an enclosure. No throttling was observed (peak junction temperature ~68 °C, far below the 95 °C threshold).
+<table>
+<tr>
+<td align="center"><strong>7W</strong><br><img src="../../non-reasoning-models/artifacts/charts/EH_itl_heatmap_7w.png" width="100%"></td>
+<td align="center"><strong>15W</strong><br><img src="../../non-reasoning-models/artifacts/charts/EH_itl_heatmap_15w.png" width="100%"></td>
+</tr>
+<tr>
+<td align="center"><strong>25W</strong><br><img src="../../non-reasoning-models/artifacts/charts/EH_itl_heatmap_25w.png" width="100%"></td>
+<td align="center"><strong>MAXN</strong><br><img src="../../non-reasoning-models/artifacts/charts/EH_itl_heatmap_maxn.png" width="100%"></td>
+</tr>
+</table>
 
-### 3.6 Why Tok/J Peaks at Short Prompt + Long Generation
+**Figure 10a: [ITL](#glossary) p50 heatmaps — all 4 power modes (rows = gen length, cols = prompt length)**
 
-Tok/J = tok/s ÷ power. When the prompt is short, the expensive prefill burst is brief. When generation is long, the GPU spends the majority of the request in the more power-efficient autoregressive decode phase. The ratio shifts in favour of decode, keeping both instantaneous power moderate and throughput high — the numerator grows while the denominator stays flat.
+- [ITL](#glossary) is driven primarily by model size and GPU clock, not prompt length. Bonsai-1.7B and Ternary-1.7B have significantly lower ITL than the 4B and 8B models at every mode.
+- The Ternary-Bonsai-1.7B achieves lower ITL than Bonsai-1.7B at every mode despite larger file size, consistent with ternary weights being faster to load from DRAM per decode step.
 
-At ctx=2048 + gen=128, most of the energy budget is spent on a 2-second prefill producing only 128 tokens. At ctx=256 + gen=512, the same energy budget produces 512 tokens from a 300 ms prefill. The difference in tok/J is 3.5× vs 5.4× for Bonsai-1.7B.
+**Decode time (s) p50** is the time spent generating output tokens: `decode_time = request_latency − TTFT`. At ctx=2048, gen=256:
+
+<a id="table-10a"></a>
+**Table 10a: Decode time speedup ratios - all pairwise mode comparisons (ctx=2048, gen=256)**
+
+| Model | 25W vs 15W | MAXN vs 15W | 15W vs 7W | 25W vs 7W | MAXN vs 7W | MAXN vs 25W |
+|-------|----------:|-----------:|---------:|---------:|----------:|-----------:|
+| Bonsai-1.7B | 1.47x | 1.59x | 2.53x | **3.73x** | 4.02x | 1.08x |
+| Bonsai-4B | 1.48x | 1.59x | 2.62x | **3.87x** | 4.18x | 1.08x |
+| Bonsai-8B | 1.42x | 1.53x | 2.76x | **3.91x** | 4.22x | 1.08x |
+| Ternary-Bonsai-1.7B | 1.48x | 1.62x | 2.59x | **3.84x** | 4.21x | 1.10x |
+| Ternary-Bonsai-4B | **1.48x** | **1.64x** | **2.75x** | **4.08x** | **4.51x** | **1.10x** |
+
+> Speedup = mean(decode_time_baseline) / mean(decode_time_mode) where decode_time = [RL](#glossary) p50 − [TTFT](#glossary) p50, at ctx=2048, gen=256. [`decode_J`](#glossary) = [`avg_power_W`](#glossary) × decode_time_s.
+
+**[TTFT](#glossary) speedup** - TTFT_baseline / TTFT_mode, averaged over all 12 prompt × gen combos:
+
+<a id="table-11"></a>
+**Table 11: [TTFT](#glossary) speedup ratios - all pairwise mode comparisons**
+
+| Model | 25W vs 15W | MAXN vs 15W | 15W vs 7W | 25W vs 7W | MAXN vs 7W | MAXN vs 25W |
+|-------|----------:|-----------:|---------:|---------:|----------:|-----------:|
+| Bonsai-1.7B | 1.46x | 1.60x | 2.40x | **3.50x** | 3.84x | 1.10x |
+| Bonsai-4B | 1.47x | 1.61x | 2.86x | 4.21x | **4.62x** | 1.10x |
+| Bonsai-8B | 1.29x | 1.56x | 2.84x | 3.66x | **4.42x** | 1.21x |
+| Ternary-Bonsai-1.7B | 1.46x | 1.60x | 2.75x | 4.02x | **4.41x** | 1.10x |
+| Ternary-Bonsai-4B | **1.48x** | 1.62x | 3.08x | **4.54x** | **4.98x** | **1.10x** |
+
+- **Bonsai-8B** shows a smaller TTFT improvement at 25W vs 15W (1.29x) compared to the 4B models (1.47–1.48x). This confirms the prefill is also becoming memory-bandwidth bound for the larger model.
+- **MAXN/7W** reaches *4.98x* for Ternary-Bonsai-4B prefill — the largest TTFT speedup in the sweep. **25W/7W** is *4.54x* for Ternary-Bonsai-4B, also the highest across all models at that comparison.
+
+**Request latency (E2E) speedup** - Speedup = mean([RL](#glossary) p50 at baseline) / mean(RL p50 at mode), averaged over all 12 prompt × gen combos:
+
+<a id="table-12"></a>
+**Table 12: Request latency (E2E) speedup ratios - all pairwise mode comparisons**
+
+| Model | 25W vs 15W | MAXN vs 15W | 15W vs 7W | 25W vs 7W | MAXN vs 7W | MAXN vs 25W |
+|-------|----------:|-----------:|---------:|---------:|----------:|-----------:|
+| Bonsai-1.7B | 1.47x | 1.59x | 2.20x | **3.24x** | 3.50x | 1.08x |
+| Bonsai-4B | 1.47x | 1.60x | 2.66x | **3.92x** | 4.24x | 1.08x |
+| Bonsai-8B | **1.51x** | 1.60x | 2.79x | **4.21x** | 4.47x | 1.06x |
+| Ternary-Bonsai-1.7B | 1.48x | 1.62x | 2.64x | **3.91x** | 4.28x | 1.09x |
+| Ternary-Bonsai-4B | **1.48x** | **1.64x** | **2.81x** | **4.16x** | **4.59x** | **1.10x** |
+
+- Mirrors the [TTFT](#glossary) speedup trends since prefill dominates request latency at these context sizes.
+
+### 3.6 Model Size vs Efficiency
+
+The relationship is clear: **smaller quantized models always win on total tok/J**, not just tok/s.
+
+<a id="table-13"></a>
+**Table 13: Best total tok/J ranked by model size**
+
+| Model | Params | GGUF | Best total tok/J | At mode / ctx / gen |
+|-------|-------:|-----:|-----------------:|---------------------|
+| Bonsai-1.7B | 1.7B | ~237 MB | **61.2** | 25W / 2048 / 128 |
+| Ternary-Bonsai-1.7B | 1.7B | ~300 MB | **59.4** | 25W / 2048 / 128 |
+| Bonsai-4B | 4B | ~540 MB | **28.8** | 25W / 2048 / 128 |
+| Ternary-Bonsai-4B | 4B | ~700 MB | **25.6** | 25W / 2048 / 128 |
+| Bonsai-8B | 8B | ~1.1 GB | **18.9** | 15W / 2048 / 128 |
+
+> Total tok/J = ([ISL](#glossary) + [OSL](#glossary)) / (avg\_power\_W × [RL](#glossary)\_p50\_s) — see [Appendix J.6](#appendix-j6) for the full formula. Peaks at ctx=2048, gen=128 for every model because the long prompt dominates the numerator while short gen minimises decode energy. All 48 mode × ctx × gen combinations were searched.
+
+Bonsai-1.7B at 25W achieves **61 total tok/J**, more than 3× more efficient than Bonsai-8B (18.9) across the full request.
+
+Notably, Bonsai-1.7B edges Ternary-Bonsai-1.7B on total tok/J (61.2 vs 59.4) despite having fewer parameters — the Q1_0 Bonsai-1.7B is slightly lighter on memory bandwidth than the Q2_0 ternary variant. Ternary-Bonsai-1.7B wins on output tok/s and output tok/J at the canonical cell instead.
 
 ---
 
-## 4. Engineering Struggles
+### 3.7 Energy Efficiency: Decode tok/J and Total tok/J
 
-### 4.1 Running at the Wrong Power Mode
+Two complementary tok/J lenses on energy efficiency — see [J.6](#appendix-j6) for formulas:
 
-The initial benchmark script called `sudo nvpmodel -m 0`, which was assumed to be max performance. It is not — it is the **15 W default boot mode**. The full nvpmodel mapping for Jetson Orin Nano Super:
+- **Decode tok/J** = *[OSL](#glossary) / [`decode_J`](#glossary)* — output tokens generated per joule of decode energy only ([TTFT](#glossary) excluded). Measures how efficiently the GPU runs the autoregressive generation loop.
+- **Total tok/J** = *([ISL](#glossary) + [OSL](#glossary)) / [`total_J`](#glossary)* — all tokens processed per joule of the full request. Accounts for both prompt processing and generation; favours models that handle long prompts cheaply.
 
-| ID | Name | GPU clock |
-|----|------|-----------|
-| 0 | 15W (default) | 612 MHz |
-| 1 | 25W | ~820 MHz |
-| 2 | **MAXN_SUPER** | **1 020 MHz** |
-| 3 | 7W | ~420 MHz |
+See [Figure 7b](#figure-7b) (decode tok/J vs prompt length) and [Figure 7c](#figure-7c) (total tok/J vs prompt length) in section 2.2. Full combinations: [F.2 Decode](#appendix-f2) · [F.3 Total](#appendix-f3).
 
-All 15W results were collected before this was caught. Rather than discard the data, both modes were benchmarked fully, producing the 15W vs MAXN comparison that ended up being one of the most informative outputs of this project. The fix: default `POWER_MODE=2` in the script, with a `--power-mode` CLI override.
 
-### 4.2 The NvMap R36.4.7 Kernel Bug
+**Key findings:**
 
-Ternary-Bonsai-8B consistently failed to load with `NvMapMemAllocInternalTagged: error 12 (ENOMEM)` despite 6 GB+ free RAM. Investigation included reducing GPU layers to 10 (weights load, KV cache allocation still fails), attempting swap (IOVA is virtual address space, not physical RAM), rebooting (partial relief, not a fix), and inspecting `/proc/buddyinfo` and CMA (only 256 MB CMA on this board).
+1. **25W wins on both metrics for sub-4B models at every prompt and gen length.** The exception is Bonsai-8B, where 15W and 25W are statistically indistinguishable on tok/J (1.77 vs 1.79 output tok/J at canonical cell).
 
-Root cause: JetPack R36.4.7 `nvmap` has a regression preventing contiguous IOVA allocations ≥ ~1.9 GB. Same bug blocks Gemma 3 4B (2.4 GB), Llama 3.1 8B, and any similarly-sized model. Fix: clean reflash to JetPack 6.2.2 (L4T 36.5).
+2. The 1.7B models reach **25–35 tok/J (decode)** vs **~10–12 tok/J** for the 4B models and **~5–6 tok/J** for Bonsai-8B. Smaller models are dramatically more energy-efficient per output token.
 
-### 4.3 IOVA Address Space Fragmentation
+3. The ternary 1.7B model has *slightly lower* decode tok/J than Bonsai-1.7B (standard) despite higher raw throughput — the Q2_0 format requires more DRAM bandwidth per token than Q1_0, which slightly increases decode energy relative to throughput.
 
-After running 4–5 models sequentially without rebooting, IOVA space fragmented enough to fail even small models. A mid-session Gemma 3 4B test (which fails at load time) partially exercised the IOVA allocator before crashing, leaving the space degraded. Subsequently, even Bonsai-4B failed on restart. Additionally, during the MAXN resume run, CMA showed only 1.5 MB free out of 256 MB total — preventing any model from loading. Fix: reboot before resuming, and `sudo systemctl stop ollama` at script startup.
+4. *Total tok/J* grows with *prompt length* because [ISL](#glossary) dominates ([ISL](#glossary)+[OSL](#glossary)) as ctx increases while [`total_J`](#glossary) grows more slowly (decode time is constant), see [F.3](#appendix-f3).
 
-### 4.4 Variable Evaluation Order Bug
 
-`TEGRA_LOG` and `TIMING_LOG` were assigned at the top of the script before `BASE_ARTIFACT` was resolved, expanding to `/model_timing.log` (root filesystem). This produced a `Permission denied` error that appeared cosmetically minor but silently broke the entire session's power-windowing, making all tok/J values come out as `None`. Fixed by moving those two assignments to after the `BASE_ARTIFACT` block.
+<a id="figure-15"></a>
+**Figure 15: Total energy per request vs output length at 25W, ctx=2048**
 
-### 4.5 Ollama Squatting on GPU Memory
+![Total energy vs output length at 25W](../../non-reasoning-models/artifacts/charts/E_total_energy_vs_gen_length.png)
 
-Ollama auto-starts on boot, holds IOVA memory, and introduces non-determinism. Added `sudo systemctl stop ollama` as the first action in the benchmark script's cleanup phase.
+<a id="figure-16"></a>
+**Figure 16: Decode energy per output token in mJ (ctx=2048, gen=256)**
 
-### 4.6 Power Outage and Resume Logic
-
-A power outage mid-run prompted adding `--resume <dir>` to the script, which scans the artifact directory for completed JSON files and skips those combos, resuming from the first missing one. Without this, each interruption would have required a full restart.
-
----
+![mJ per output token by mode](../../non-reasoning-models/artifacts/charts/E_mj_per_output_token.png)
 
 ## 5. Conclusion
 
 ### What These Numbers Mean for Edge Inference
 
-The Bonsai family demonstrates that useful LLM inference is genuinely practical on a $250 embedded board. At 1.7B parameters:
+Ultra-low-bit Bonsai inference on a $250 Jetson Orin Nano Super 8GB is genuinely practical. At Ternary-Bonsai-1.7B Q2_0:
 
-- **17–41 tok/s** depending on power mode — fast enough for fluid interactive use
-- **237–300 MB on disk** — fits on a microSD with room to spare
-- **3–8 W under load** — runs on a USB-C power bank
-- **5.1–5.4 tok/J** — the best energy efficiency measured in this suite
+- **34.8 tok/s** at 25W: real-time fluent generation
+- **~300 MB on disk**: trivially portable
+- **6.96 W under load**: runs on a USB-C power bank
+- **5.03 output tok/J**: the best energy efficiency in this suite
 
-The 4B models double the capability footprint while staying under 700 MB and 10 W. The 8B model is viable for demanding tasks (multi-turn reasoning, structured output, RAG) at ~16–17 tok/s at MAXN.
+Bonsai-1.7B Q1_0 pushes even further: **61.2 total tok/J** (best in suite) in only **237 MB** at **4.70 W** average under load. The standard Q1_0 models are lighter on disk and memory bandwidth; the Ternary Q2_0 variants generate faster output tokens per second.
 
-### The 15W vs MAXN Trade-off
+Bonsai-8B at 25W hits **14.0 tok/s** in 1.1 GB — the fastest 8B model on this platform — but energy efficiency peaks at 15W. Operators running Bonsai-8B should prefer 15W unless raw throughput is critical.
 
-This is the clearest finding of the dual-mode sweep: **MAXN_SUPER gives you 60 % more speed for ~10 % worse energy efficiency.** The GPU clock ceiling at 15W (612 MHz) is the binding constraint — not the TDP cap, not memory bandwidth. Raising the clock ceiling to 1 020 MHz with `jetson_clocks` at MAXN_SUPER delivers throughput proportional to the clock increase.
+### The Clear Winner: 25W Mode (for sub-4B models)
 
-Choose based on deployment context:
+**25W (nvpmodel -m 1) is the Pareto-optimal power mode for Bonsai-1.7B and Bonsai-4B inference on the Jetson Orin Nano Super.** It is the right answer for the majority of deployments:
 
-| Use case | Recommended mode |
-|----------|-----------------|
-| Always-on / battery / solar IoT | **15W** — best tok/J, lowest heat |
-| Interactive chat, real-time assistant | **MAXN** — 60 % faster, still under 10 W |
-| Long-context RAG (2K prompt) | **MAXN** — prefill 60 % faster |
-| Thermally constrained enclosure | **15W** — ~4 W lower peak draw |
+- *~47 % more* throughput than 15W (1.7B class)
+- Only *~40 % more* power than 15W
+- *10–11 %* better output tok/J than MAXN
+- Low peak power (≤ 7 W for 1.7B–4B models) for sustained operation
 
-### What Is Still Blocked
+For **Bonsai-8B**: prefer **15W** for energy-efficiency-neutral operation at ~43 % lower board power than 25W.
 
-Ternary-Bonsai-8B and any other model requiring > 1.9 GB contiguous CUDA allocation cannot run on JetPack R36.4.7. Upgrading to JetPack 6.2.2 (L4T 36.5) via SDK Manager clean flash is the only fix. At MAXN_SUPER with a working Ternary-8B, projecting from the Ternary-4B speedup pattern, expect ~26 tok/s and ~15 W — a compelling point for on-device 8B inference.
+Use MAXN only when raw [TTFT](#glossary) matters (live interactive sessions with long prompts). Never use 7W for production inference: CMA fragmentation will eventually block model loads in multi-model sessions.
+
+### What Is Not Yet Benchmarked
+
+- **Ternary-Bonsai-8B**: OOM at all power modes. The ~1.4 GB GGUF is within bounds, but KV cache + CUDA overhead pushes total allocation over 8 GB. Fix: reflash to JetPack 6.2.2 (L4T 36.5) for updated CMA handling, or run with reduced context window.
+- **Multi-user concurrency**: all results are single-user. Real-world servers will see different throughput profiles at concurrency > 1.
+- **Ollama backend**: matched-quant Ollama comparison is the next phase.
+
+### **CMA fragmentation caveat:** 
+
+- After sequential model loads in the same OS session, the CUDA IOVA address space accumulates fragmentation that can block `cudaMalloc` calls requiring large contiguous buffers. CMA was compacted (`/proc/sys/vm/compact_memory`) between model loads. All 5 active Bonsai models produced valid data at all modes where they were run; no CMA-induced failures were observed for the tested models.
+
+---
+<a id="appendix-a"></a>
+## Appendix A: Full 4-Mode Comparison (ctx=2048, gen=256)
+
+> Raw numbers from the canonical benchmark cell. All latencies in milliseconds. Power = [`VDD_CPU_GPU_CV`](#glossary) averaged over each run window.
+
+<a id="table-15"></a>
+**Table 15: Full 4-mode comparison, ctx=2048, gen=256**
+
+| Model | Mode | Output Tok/s | TTFT p50 (ms) | ITL p50 (ms) | Power (W) | Output Tok/J |
+|-------|------|------:|----------:|---------:|----------:|------:|
+| Bonsai-1.7B | 7W   | 6.5 | 5416.3 | 153.68 | 1.56 | 4.18 |
+| Bonsai-1.7B | 15W  | 16.5 | 1985.1 | 60.69 | 3.55 | 4.66 |
+| Bonsai-1.7B | 25W  | **24.2** | **1352.8** | **41.23** | 5.01 | **4.86** |
+| Bonsai-1.7B | MAXN | 26.2 | 1235.3 | 38.21 | 6.06 | 4.34 |
+| Bonsai-4B | 7W   | 3.5 | 13449.3 | 285.65 | 1.71 | 2.06 |
+| Bonsai-4B | 15W  | 9.2 | 4621.8 | 108.91 | 3.94 | 2.34 |
+| Bonsai-4B | 25W  | **13.5** | **3133.4** | **73.84** | 5.63 | **2.41** |
+| Bonsai-4B | MAXN | 14.6 | 2859.9 | 68.33 | 6.85 | 2.14 |
+| Bonsai-8B | 7W   | 3.6 | 21725.1 | 278.71 | 2.13 | 1.69 |
+| Bonsai-8B | 15W  | 9.9 | 7663.4 | 101.04 | 5.54 | **1.79** |
+| Bonsai-8B | 25W  | **14.0** | **5502.6** | **71.23** | 7.95 | 1.77 |
+| Bonsai-8B | MAXN | 15.1 | 5063.4 | 66.07 | 9.53 | 1.59 |
+| Ternary-Bonsai-1.7B | 7W   | 9.1 | 6154.7 | 110.22 | 1.96 | 4.65 |
+| Ternary-Bonsai-1.7B | 15W  | 23.5 | 2230.4 | 42.57 | 4.87 | 4.85 |
+| Ternary-Bonsai-1.7B | 25W  | **34.8** | **1514.9** | **28.70** | 6.96 | **5.03** |
+| Ternary-Bonsai-1.7B | MAXN | 38.1 | 1384.1 | 26.21 | 8.55 | 4.48 |
+| Ternary-Bonsai-4B | 7W   | 4.1 | 15390.2 | 241.27 | 1.96 | 2.12 |
+| Ternary-Bonsai-4B | 15W  | 11.4 | 5279.8 | 87.62 | 5.14 | **2.23** |
+| Ternary-Bonsai-4B | 25W  | **16.9** | **3568.9** | **59.09** | 7.53 | **2.26** |
+| Ternary-Bonsai-4B | MAXN | **18.7** | **3257.5** | **53.55** | 9.22 | 2.03 |
+| Ternary-Bonsai-8B | all  | OOM: too large for 8 GB unified memory at any power mode |||||||
+
+
+
+<a id="appendix-b"></a>
+## Appendix B: Thermal Summary - All Power Modes
+
+Power and temperature averaged over each model's full benchmark window (all *12 prompt×gen* combos). **No model triggered thermal throttling** at any power mode (threshold ≈ 95 °C).
+
+>**Junction temperature (TJ)** is the hottest internal die temperature on the Jetson SoC, reported by `tegrastats` as `tj@`. It is the primary metric for thermal safety: if TJ reaches ~95 °C, the hardware automatically throttles clocks to prevent damage. Peak TJ < 76 °C across all runs means thermal headroom is ample.
+
+<a id="table-16"></a>
+**Table 16: Thermal summary - all power modes**
+
+| Model | Mode | Avg Power (W) | Avg CPU (°C) | Avg GPU (°C) | Peak TJ (°C) | Throttled |
+|-------|------|-------------:|-------------:|-------------:|-------------:|:---------:|
+| Bonsai-1.7B | 7W   | 1.50 | 53.6 | 54.9 | 55.8 | No |
+| Bonsai-1.7B | 15W  | 3.35 | 55.6 | 56.8 | 59.0 | No |
+| Bonsai-1.7B | 25W  | 4.70 | 62.5 | 63.7 | 65.9 | No |
+| Bonsai-1.7B | MAXN | 5.65 | 62.1 | 63.3 | 65.9 | No |
+| Bonsai-4B | 7W   | 1.61 | 53.7 | 55.0 | 57.3 | No |
+| Bonsai-4B | 15W  | 3.75 | 58.3 | 59.5 | 61.7 | No |
+| Bonsai-4B | 25W  | 5.29 | 62.4 | 63.8 | 66.2 | No |
+| Bonsai-4B | MAXN | 6.38 | 63.4 | 64.7 | 67.7 | No |
+| Bonsai-8B | 7W   | 2.04 | 54.7 | 56.1 | 58.3 | No |
+| Bonsai-8B | 15W  | 5.47 | 61.1 | 62.5 | 64.6 | No |
+| Bonsai-8B | 25W  | 7.95 | 66.3 | 67.9 | 70.4 | No |
+| Bonsai-8B | MAXN | 9.80 | 69.9 | 71.8 | 75.3 | No |
+| Ternary-Bonsai-1.7B | 7W   | 1.93 | 54.8 | 56.2 | 57.0 | No |
+| Ternary-Bonsai-1.7B | 15W  | 4.79 | 61.2 | 62.5 | 63.8 | No |
+| Ternary-Bonsai-1.7B | 25W  | 6.81 | 64.3 | 65.9 | 69.2 | No |
+| Ternary-Bonsai-1.7B | MAXN | 8.47 | 68.2 | 69.7 | 72.4 | No |
+| Ternary-Bonsai-4B | 7W   | 1.96 | 54.7 | 56.0 | 57.8 | No |
+| Ternary-Bonsai-4B | 15W  | 5.09 | 60.6 | 62.0 | 63.7 | No |
+| Ternary-Bonsai-4B | 25W  | 7.43 | 65.7 | 67.2 | 69.3 | No |
+| Ternary-Bonsai-4B | MAXN | 9.11 | 68.4 | 70.0 | 71.8 | No |
+
+
+
+<a id="appendix-c"></a>
+## Appendix C: Full Per-Mode Raw Data
+
+Complete per-cell JSON exports (all 33 metrics, all 12 prompt×gen combos × 20 requests per cell) are published on Hugging Face Datasets:
+
+| Mode | Dataset | Models | Cells |
+|------|---------|-------:|------:|
+| 7W   | [`YuvrajSingh9886/jetson-bonsai-benchmark-7w`](https://huggingface.co/datasets/YuvrajSingh9886/jetson-bonsai-benchmark-7w) | 5 | 60 |
+| 15W  | [`YuvrajSingh9886/jetson-bonsai-benchmark-15w`](https://huggingface.co/datasets/YuvrajSingh9886/jetson-bonsai-benchmark-15w) | 5 | 60 |
+| 25W  | [`YuvrajSingh9886/jetson-bonsai-benchmark-25w`](https://huggingface.co/datasets/YuvrajSingh9886/jetson-bonsai-benchmark-25w) | 5 | 60 |
+| MAXN | [`YuvrajSingh9886/jetson-bonsai-benchmark-maxn`](https://huggingface.co/datasets/YuvrajSingh9886/jetson-bonsai-benchmark-maxn) | 5 | 60 |
+
+Each dataset contains the full `profile_export_aiperf.json` per cell (all 33 metrics including `ISL`, `OSL`, `TTFT avg/p50/p90/p99`, `ITL`, `output tok/s`, `request latency`, `prefill tok/s`, `power W`, `output tok/J`), `tegrastats.log`, and per-model server logs.
+
+
+
+<a id="appendix-e"></a>
+## Appendix E: Full 12-Combination Heatmaps (All Power Modes)
+
+Each heatmap is a `2×3` grid (5 models, 6th panel unused) showing all `12 prompt×gen` combinations for one power mode and one metric. Rows = gen length (128, 256, 512 tok), columns = prompt length (256, 512, 1024, 2048 tok). Brighter colour = higher value.
+
+<a id="appendix-e1"></a>
+### E.1 Output Tok/s heatmaps
+
+**Figure E.1a: All 12 combos at 7W**
+
+![Tok/s heatmap 7W](../../non-reasoning-models/artifacts/charts/E_tok_s_heatmap_7w.png)
+
+**Figure E.1b: All 12 combos at 15W**
+
+![Tok/s heatmap 15W](../../non-reasoning-models/artifacts/charts/E_tok_s_heatmap_15w.png)
+
+**Figure E.1c: All 12 combos at 25W**
+
+![Tok/s heatmap 25W](../../non-reasoning-models/artifacts/charts/E_tok_s_heatmap_25w.png)
+
+**Figure E.1d: All 12 combos at MAXN**
+
+![Tok/s heatmap MAXN](../../non-reasoning-models/artifacts/charts/E_tok_s_heatmap_maxn.png)
+
+<a id="appendix-e2"></a>
+### E.2 Output Tok/J heatmaps
+
+**Figure E.2a: All 12 combos at 7W**
+
+![Tok/J heatmap 7W](../../non-reasoning-models/artifacts/charts/E_tok_j_heatmap_7w.png)
+
+**Figure E.2b: All 12 combos at 15W**
+
+![Tok/J heatmap 15W](../../non-reasoning-models/artifacts/charts/E_tok_j_heatmap_15w.png)
+
+**Figure E.2c: All 12 combos at 25W**
+
+![Tok/J heatmap 25W](../../non-reasoning-models/artifacts/charts/E_tok_j_heatmap_25w.png)
+
+**Figure E.2d: All 12 combos at MAXN**
+
+![Tok/J heatmap MAXN](../../non-reasoning-models/artifacts/charts/E_tok_j_heatmap_maxn.png)
+
+
+
+<a id="appendix-f"></a>
+## Appendix F: Prefill / Decode / Total tok/J: All Combinations
+
+All charts are 2×3 faceted line plots with a fixed y-scale across all subplots. The canonical combination (ctx=2048, gen=256) is also shown in §2.2.
+
+<a id="appendix-f1"></a>
+### F.1 Prefill tok/J (input tok / J) vs prompt length
+
+**Figure F.1a: Prefill tok/J vs prompt length: gen=128**
+
+<a id="figure-f1a"></a>
+
+![Prefill tok/J vs prompt gen=128](../../non-reasoning-models/artifacts/charts/EF_prefill_tokj_vs_prompt_gen128.png)
+
+**Figure F.1b: Prefill tok/J vs prompt length: gen=256** *(canonical, also in § 2.2)*
+
+<a id="figure-f1b"></a>
+
+![Prefill tok/J vs prompt gen=256](../../non-reasoning-models/artifacts/charts/22e_prefill_tokj_vs_prompt_gen256.png)
+
+**Figure F.1c: Prefill tok/J vs prompt length: gen=512**
+
+<a id="figure-f1c"></a>
+
+![Prefill tok/J vs prompt gen=512](../../non-reasoning-models/artifacts/charts/22e_prefill_tokj_vs_prompt_gen512.png)
+
+<a id="appendix-f2"></a>
+### F.2 Decode tok/J (output tok / J) - independent of prompt length
+
+Decode tok/J depends on the number of output tokens (gen length), not input prompt length, since decode happens after prefill completes. These charts show decode tok/J as a function of **gen length** for each prompt context length.
+
+**Figure F.2a: Decode tok/J vs gen length: ctx=256**
+
+<a id="figure-f2a"></a>
+
+![Decode tok/J vs gen ctx=256](../../non-reasoning-models/artifacts/charts/EF_decode_tokj_vs_gen_ctx256.png)
+
+**Figure F.2b: Decode tok/J vs gen length: ctx=512**
+
+<a id="figure-f2b"></a>
+
+![Decode tok/J vs gen ctx=512](../../non-reasoning-models/artifacts/charts/EF_decode_tokj_vs_gen_ctx512.png)
+
+**Figure F.2c: Decode tok/J vs gen length: ctx=1024**
+
+<a id="figure-f2c"></a>
+
+![Decode tok/J vs gen ctx=1024](../../non-reasoning-models/artifacts/charts/EF_decode_tokj_vs_gen_ctx1024.png)
+
+**Figure F.2d: Decode tok/J vs gen length: ctx=2048**
+
+<a id="figure-f2d"></a>
+
+![Decode tok/J vs gen ctx=2048](../../non-reasoning-models/artifacts/charts/EF_decode_tokj_vs_gen_ctx2048.png)
+
+<a id="appendix-f3"></a>
+### F.3 Total tok/J ((input+output) tok / J) vs prompt length
+
+**Figure F.3a: Total tok/J vs prompt length: gen=128**
+
+<a id="figure-f3a"></a>
+
+![Total tok/J vs prompt gen=128](../../non-reasoning-models/artifacts/charts/EF_total_tokj_vs_prompt_gen128.png)
+
+**Figure F.3b: Total tok/J vs prompt length: gen=256** *(canonical, also in § 2.2)*
+
+<a id="figure-f3b"></a>
+
+![Total tok/J vs prompt gen=256](../../non-reasoning-models/artifacts/charts/22g_total_tokj_vs_prompt_gen256.png)
+
+**Figure F.3c: Total tok/J vs prompt length: gen=512**
+
+<a id="figure-f3c"></a>
+
+![Total tok/J vs prompt gen=512](../../non-reasoning-models/artifacts/charts/22g_total_tokj_vs_prompt_gen512.png)
+
+
+
+<a id="appendix-g"></a>
+## Appendix G: Request Latency (E2E): All Combinations
+
+Request latency (E2E) p50 - total time from request start to last token received. Line charts show variation with prompt length (2×3 facet, fixed y-scale).
+
+<a id="appendix-g1"></a>
+### G.1 Request latency vs prompt length (by gen length)
+
+**Figure G.1a: Request latency vs prompt length: gen=128**
+
+<a id="figure-g1a"></a>
+
+![Request latency vs prompt gen=128](../../non-reasoning-models/artifacts/charts/EF_req_latency_vs_prompt_gen128.png)
+
+**Figure G.1b: Request latency vs prompt length: gen=256** *(canonical, also in §2.3)*
+
+<a id="figure-g1c"></a>
+
+![Request latency vs prompt gen=256](../../non-reasoning-models/artifacts/charts/22a_request_latency_vs_prompt_gen256.png)
+
+
+
+<a id="appendix-g"></a>
+<a id="appendix-g-ttft"></a>
+## Appendix G: TTFT: All Prompt x Gen Combinations
+
+TTFT p50 (median time to first token, ms) is driven almost entirely by prompt length — it is the prefill cost. These charts show how it varies across all 12 prompt × gen combinations and across all 4 power modes.
+
+<a id="appendix-g1-ttft"></a>
+### G.1 TTFT vs prompt length (by gen length)
+
+**Figure G.1a: TTFT vs prompt length: gen=128**
+
+<a id="figure-g1a"></a>
+
+![TTFT vs prompt gen=128](../../non-reasoning-models/artifacts/charts/EG_ttft_vs_prompt_gen128.png)
+
+**Figure G.1b: TTFT vs prompt length: gen=256** *(canonical, also in section 2.3)*
+
+![TTFT vs prompt gen=256](../../non-reasoning-models/artifacts/charts/EG_ttft_vs_prompt_gen256.png)
+
+*TTFT is independent of gen length, so gen=128 and gen=256 show the same trend; gen=512 is omitted.*
 
 ---
 
-## Appendix A — Full Results Table (15W Run)
+<a id="appendix-g2-ttft"></a>
+### G.2 TTFT heatmaps (gen x prompt) per power mode
 
-Raw data for all 57 valid combos from `bonsai-all-20260525-0243`. For MAXN data see `report_max.md`.
+Each cell is TTFT in ms. Rows = gen length, columns = prompt length. Independent of `gen` length hence the same across rows.
 
-Cells marked `—` = OOM or context window exceeded by design.  
-All latencies in milliseconds. Throughput in tokens/second.
+<table>
+<tr>
+<td align="center">
+  <a id="figure-g2a"></a>
+  <strong>Figure G.2a: TTFT heatmap: 7W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EG_ttft_heatmap_7w.png" width="100%">
+</td>
+<td align="center">
+  <a id="figure-g2b"></a>
+  <strong>Figure G.2b: TTFT heatmap: 15W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EG_ttft_heatmap_15w.png" width="100%">
+</td>
+</tr>
+<tr>
+<td align="center">
+  <a id="figure-g2c"></a>
+  <strong>Figure G.2c: TTFT heatmap: 25W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EG_ttft_heatmap_25w.png" width="100%">
+</td>
+<td align="center">
+  <a id="figure-g2d"></a>
+  <strong>Figure G.2d: TTFT heatmap: MAXN</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EG_ttft_heatmap_maxn.png" width="100%">
+</td>
+</tr>
+</table>
 
-| Model | Quant | ISL | OSL | OSL mm% | TTFT avg | p50 | p90 | p99 | T2T avg | p50 | p90 | p99 | ITL avg | p50 | p90 | p99 | Tok/s | Req/s | E2E avg | p50 | p90 | p99 | RLat avg | p50 | p90 | p99 | Prefill avg | p50 | p90 | p99 | Power W | **Tok/J** |
-|-------|-------|:---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Bonsai-1.7B | Q1_0 | 256.0 | 127.9 | -0.08 | 297.8 | 297.3 | 298.6 | 302.6 | 60.1 | 60.0 | 60.6 | 60.9 | 56.61 | 56.57 | 56.64 | 57.42 | 17.08 | 0.134 | 17.09 | 17.11 | 17.12 | 17.22 | 7481.9 | 7481.9 | 7485.4 | 7488.2 | 859.6 | 861.1 | 862.3 | 862.8 | 3.29 | **5.191** |
-| Bonsai-1.7B | Q1_0 | 512.0 | 128.0 | -0.04 | 534.8 | 531.6 | 532.5 | 582.9 | 60.4 | 60.6 | 60.7 | 60.8 | 57.22 | 57.20 | 57.22 | 57.59 | 16.40 | 0.128 | 16.41 | 16.42 | 16.43 | 16.43 | 7798.4 | 7795.9 | 7799.3 | 7844.6 | 957.9 | 963.2 | 964.1 | 964.2 | 3.38 | **4.857** |
-| Bonsai-1.7B | Q1_0 | 1024.0 | 128.1 | 0.08 | 1003.5 | 1002.7 | 1004.3 | 1011.5 | 61.6 | 61.8 | 61.9 | 62.0 | 58.32 | 58.37 | 58.39 | 58.39 | 15.21 | 0.119 | 15.22 | 15.21 | 15.23 | 15.33 | 8415.9 | 8415.8 | 8419.0 | 8423.2 | 1020.5 | 1021.2 | 1021.8 | 1022.1 | 3.52 | **4.323** |
-| Bonsai-1.7B | Q1_0 | 2048.0 | 128.0 | -0.04 | 1985.0 | 1984.4 | 1985.1 | 1995.8 | — | — | — | — | 60.65 | 60.64 | 60.66 | 61.08 | 13.20 | — | 13.21 | 13.22 | 13.22 | 13.24 | 9684.5 | 9685.4 | 9688.1 | 9698.2 | — | — | — | — | 3.79 | **3.486** |
-| Bonsai-1.7B | Q1_0 | 256.0 | 255.8 | -0.08 | 297.8 | 297.6 | 297.8 | 303.3 | 60.1 | 60.0 | 60.5 | 61.0 | 56.65 | 56.60 | 56.81 | 57.18 | 17.36 | 0.068 | 17.36 | 17.38 | 17.39 | 17.44 | 14730.9 | 14728.8 | 14739.0 | 14744.7 | 859.6 | 860.3 | 861.6 | 862.3 | 3.26 | **5.328** |
-| Bonsai-1.7B | Q1_0 | 512.0 | 255.8 | -0.10 | 533.3 | 531.9 | 534.2 | 550.1 | 60.7 | 60.6 | 60.8 | 61.5 | 57.27 | 57.23 | 57.45 | 57.62 | 16.90 | 0.066 | 16.91 | 16.93 | 16.94 | 16.94 | 15123.1 | 15122.6 | 15126.9 | 15145.0 | 960.1 | 962.6 | 963.3 | 963.9 | 3.28 | **5.152** |
-| Bonsai-1.7B | Q1_0 | 1024.0 | 255.6 | -0.16 | 1003.5 | 1003.1 | 1004.3 | 1010.4 | 61.8 | 61.9 | 62.0 | 62.1 | 58.47 | 58.38 | 58.63 | 59.04 | 16.08 | 0.063 | 16.09 | 16.11 | 16.12 | 16.12 | 15889.9 | 15889.0 | 15891.7 | 15922.4 | 1020.4 | 1020.8 | 1021.4 | 1022.6 | 3.38 | **4.761** |
-| Bonsai-1.7B | Q1_0 | 2048.0 | 255.7 | -0.14 | 1985.6 | 1985.1 | 1986.5 | 1994.2 | 63.9 | 63.9 | 64.0 | 64.1 | 60.77 | 60.69 | 60.96 | 61.57 | 14.64 | 0.057 | 14.64 | 14.66 | 14.67 | 14.71 | 17460.1 | 17459.9 | 17470.5 | 17473.8 | 1031.4 | 1031.7 | 1032.3 | 1032.8 | 3.55 | **4.124** |
-| Bonsai-1.7B | Q1_0 | 256.0 | 501.9 | -1.96 | 298.1 | 297.7 | 298.2 | 305.0 | 60.1 | 60.0 | 60.9 | 61.0 | 56.97 | 56.91 | 57.06 | 57.96 | 17.40 | 0.035 | 17.41 | 17.43 | 17.45 | 17.46 | 28836.2 | 29376.6 | 29382.1 | 29397.4 | 858.7 | 860.0 | 861.1 | 861.5 | 3.22 | **5.396** |
-| Bonsai-1.7B | Q1_0 | 512.0 | 509.5 | -0.49 | 532.6 | 532.1 | 533.1 | 538.7 | 60.7 | 60.6 | 60.8 | 62.2 | 57.50 | 57.51 | 57.56 | 57.68 | 17.11 | 0.034 | 17.11 | 17.11 | 17.14 | 17.15 | 29771.5 | 29919.0 | 29924.6 | 29957.6 | 961.3 | 962.3 | 963.1 | 963.6 | 3.25 | **5.266** |
-| Bonsai-1.7B | Q1_0 | 1024.0 | 511.9 | -0.03 | 1003.7 | 1003.2 | 1004.5 | 1009.4 | 61.9 | 61.9 | 62.0 | 62.8 | 58.66 | 58.65 | 58.78 | 58.99 | 16.52 | 0.032 | 16.53 | 16.53 | 16.55 | 16.58 | 30972.4 | 30973.8 | 30986.5 | 31022.6 | 1020.3 | 1020.7 | 1021.3 | 1022.3 | 3.30 | **5.004** |
-| Bonsai-1.7B | Q1_0 | 2048.0 | 492.3 | -3.85 | 1985.8 | 1985.3 | 1986.8 | 1992.7 | 63.9 | 64.0 | 64.1 | 64.4 | 60.98 | 60.92 | 61.15 | 61.38 | 15.40 | 0.031 | 15.41 | 15.44 | 15.45 | 15.47 | 31946.2 | 32375.0 | 32389.4 | 32476.6 | 1031.3 | 1031.6 | 1032.0 | 1032.4 | 3.42 | **4.504** |
-| Bonsai-4B | Q1_0 | 256.0 | 128.0 | -0.04 | 674.0 | 673.6 | 674.7 | 678.7 | 108.4 | 108.4 | 108.5 | 108.5 | 103.89 | 103.89 | 103.91 | 103.93 | 9.23 | 0.072 | 9.23 | 9.23 | 9.23 | 9.23 | 13862.8 | 13868.6 | 13870.5 | 13876.9 | 379.8 | 380.0 | 380.4 | 380.4 | 3.65 | **2.530** |
-| Bonsai-4B | Q1_0 | 512.0 | 128.0 | -0.04 | 1211.1 | 1210.7 | 1211.3 | 1217.5 | 109.1 | 109.2 | 109.3 | 109.4 | 104.63 | 104.60 | 104.63 | 105.31 | 8.82 | 0.069 | 8.83 | 8.83 | 8.84 | 8.84 | 14493.8 | 14494.4 | 14497.5 | 14513.4 | 422.8 | 422.9 | 423.1 | 423.2 | 3.72 | **2.369** |
-| Bonsai-4B | Q1_0 | 1024.0 | 127.8 | -0.12 | 2316.1 | 2315.8 | 2316.6 | 2322.2 | 110.5 | 110.6 | 110.7 | 110.8 | 106.09 | 106.01 | 106.03 | 107.38 | 8.10 | 0.063 | 8.11 | 8.11 | 8.11 | 8.12 | 15773.5 | 15778.4 | 15781.0 | 15786.1 | 442.1 | 442.2 | 442.3 | 442.4 | 3.89 | **2.084** |
-| Bonsai-4B | Q1_0 | 2048.0 | 128.0 | 0.00 | 4622.0 | 4621.6 | 4622.9 | 4628.9 | 113.4 | 113.4 | 113.5 | 113.9 | 108.88 | 108.87 | 108.92 | 108.97 | 6.94 | 0.054 | 6.94 | 6.94 | 6.94 | 6.94 | 18449.2 | 18447.7 | 18456.0 | 18461.1 | 443.1 | 443.1 | 443.2 | 443.3 | 4.17 | **1.663** |
-| Bonsai-4B | Q1_0 | 256.0 | 256.1 | 0.02 | 674.4 | 673.8 | 675.0 | 680.9 | 108.5 | 108.4 | 108.7 | 109.6 | 103.91 | 103.94 | 103.95 | 104.27 | 9.42 | 0.037 | 9.42 | 9.42 | 9.42 | 9.48 | 27177.2 | 27178.2 | 27181.9 | 27186.4 | 379.6 | 379.9 | 380.2 | 380.4 | 3.61 | **2.610** |
-| Bonsai-4B | Q1_0 | 512.0 | 255.9 | -0.04 | 1211.5 | 1211.1 | 1211.6 | 1217.6 | 109.4 | 109.3 | 109.9 | 110.4 | 104.68 | 104.65 | 104.71 | 105.40 | 9.17 | 0.036 | 9.17 | 9.18 | 9.18 | 9.21 | 27894.8 | 27895.6 | 27900.1 | 27906.4 | 422.6 | 422.7 | 422.9 | 423.0 | 3.66 | **2.504** |
-| Bonsai-4B | Q1_0 | 1024.0 | 255.9 | -0.04 | 2316.6 | 2316.0 | 2317.6 | 2323.2 | 110.6 | 110.6 | 110.7 | 110.7 | 106.10 | 106.07 | 106.15 | 106.46 | 8.71 | 0.034 | 8.72 | 8.72 | 8.72 | 8.72 | 29362.1 | 29362.4 | 29366.8 | 29376.1 | 442.0 | 442.1 | 442.3 | 442.4 | 3.76 | **2.318** |
-| Bonsai-4B | Q1_0 | 2048.0 | 255.9 | -0.04 | 4622.2 | 4621.8 | 4623.3 | 4628.7 | 113.2 | 113.3 | 113.5 | 113.7 | 108.96 | 108.91 | 108.99 | 109.35 | 7.90 | 0.031 | 7.90 | 7.90 | 7.90 | 7.90 | 32395.3 | 32393.6 | 32402.1 | 32409.5 | 443.1 | 443.1 | 443.2 | 443.3 | 3.94 | **2.004** |
-| Bonsai-4B | Q1_0 | 256.0 | 506.9 | -1.00 | 674.4 | 674.0 | 674.6 | 680.7 | 108.3 | 108.4 | 108.5 | 108.6 | 104.29 | 104.27 | 104.31 | 104.51 | 9.48 | 0.019 | 9.49 | 9.49 | 9.49 | 9.49 | 53434.5 | 53958.1 | 53966.1 | 53974.1 | 379.6 | 379.8 | 380.1 | 380.2 | 3.60 | **2.636** |
-| Bonsai-4B | Q1_0 | 512.0 | 511.6 | -0.08 | 1212.5 | 1212.0 | 1213.9 | 1219.0 | 109.2 | 109.2 | 109.4 | 110.1 | 105.08 | 105.01 | 105.22 | 105.42 | 9.32 | 0.018 | 9.32 | 9.33 | 9.33 | 9.33 | 54865.9 | 54866.5 | 54872.7 | 54875.3 | 422.3 | 422.4 | 422.8 | 422.9 | 3.65 | **2.551** |
-| Bonsai-4B | Q1_0 | 1024.0 | 511.7 | -0.06 | 2318.3 | 2316.9 | 2321.1 | 2331.0 | 110.8 | 110.8 | 111.0 | 111.1 | 106.47 | 106.41 | 106.62 | 106.95 | 9.02 | 0.018 | 9.03 | 9.03 | 9.03 | 9.03 | 56694.6 | 56692.1 | 56707.2 | 56729.3 | 441.7 | 442.0 | 442.1 | 442.3 | 3.73 | **2.418** |
-| Bonsai-4B | Q1_0 | 2048.0 | 499.9 | -2.36 | 4622.6 | 4622.3 | 4623.5 | 4629.2 | 113.2 | 113.3 | 113.4 | 113.5 | 109.24 | 109.23 | 109.27 | 109.46 | 8.45 | 0.017 | 8.46 | 8.46 | 8.46 | 8.46 | 59124.5 | 59126.2 | 59134.6 | 59138.6 | 443.0 | 443.1 | 443.2 | 443.2 | 3.83 | **2.207** |
-| Bonsai-8B | Q1_0 | 256.0 | 128.0 | 0.00 | 1159.5 | 1123.7 | 1136.0 | 1668.1 | 100.6 | 100.6 | 100.8 | 101.3 | 95.94 | 95.93 | 95.97 | 96.15 | 9.59 | 0.075 | 9.59 | 9.62 | 9.62 | 9.62 | 13344.3 | 13306.4 | 13320.8 | 13878.6 | 223.1 | 227.8 | 227.9 | 228.0 | 5.46 | **1.757** |
-| Bonsai-8B | Q1_0 | 512.0 | 128.0 | 0.00 | 2019.4 | 2018.9 | 2020.1 | 2025.5 | 101.3 | 101.4 | 101.4 | 101.9 | 96.67 | 96.68 | 96.69 | 96.69 | 8.95 | 0.070 | 8.95 | 8.95 | 8.95 | 8.96 | 14296.9 | 14297.3 | 14299.2 | 14303.3 | 253.5 | 253.6 | 253.7 | 253.7 | 5.49 | **1.630** |
-| Bonsai-8B | Q1_0 | 1024.0 | 127.9 | -0.08 | 3852.9 | 3852.3 | 3853.0 | 3861.7 | 102.7 | 102.8 | 102.9 | 103.0 | 98.20 | 98.13 | 98.22 | 98.89 | 7.84 | 0.061 | 7.84 | 7.85 | 7.85 | 7.85 | 16314.6 | 16314.5 | 16317.0 | 16322.9 | 265.8 | 265.8 | 265.8 | 265.9 | 5.53 | **1.416** |
-| Bonsai-8B | Q1_0 | 256.0 | 255.8 | -0.06 | 1124.1 | 1123.6 | 1124.3 | 1131.7 | 100.6 | 100.6 | 100.7 | 100.8 | 96.06 | 96.00 | 96.01 | 96.92 | 9.99 | 0.039 | 9.99 | 10.00 | 10.00 | 10.00 | 25603.9 | 25602.9 | 25606.5 | 25618.2 | 227.7 | 227.8 | 227.9 | 228.0 | 5.45 | **1.834** |
-| Bonsai-8B | Q1_0 | 512.0 | 256.0 | 0.00 | 2020.4 | 2019.4 | 2020.8 | 2035.4 | 101.4 | 101.4 | 101.7 | 102.4 | 96.71 | 96.72 | 96.73 | 96.73 | 9.59 | 0.037 | 9.59 | 9.59 | 9.60 | 9.60 | 26682.6 | 26682.0 | 26687.6 | 26695.7 | 253.4 | 253.5 | 253.6 | 253.7 | 5.45 | **1.760** |
-| Bonsai-8B | Q1_0 | 1024.0 | 255.9 | -0.02 | 3853.6 | 3853.3 | 3853.9 | 3860.4 | 102.9 | 102.9 | 103.1 | 103.7 | 98.18 | 98.16 | 98.18 | 98.48 | 8.86 | 0.035 | 8.86 | 8.86 | 8.86 | 8.87 | 28883.8 | 28884.5 | 28887.8 | 28888.5 | 265.7 | 265.7 | 265.8 | 265.8 | 5.47 | **1.618** |
-| Bonsai-8B | Q1_0 | 256.0 | 511.9 | -0.01 | 1124.4 | 1123.8 | 1124.8 | 1133.3 | 100.5 | 100.6 | 100.7 | 100.7 | 96.35 | 96.34 | 96.36 | 96.50 | 10.16 | 0.020 | 10.17 | 10.17 | 10.17 | 10.17 | 50354.7 | 50356.3 | 50362.3 | 50363.8 | 227.7 | 227.8 | 227.9 | 227.9 | 5.43 | **1.872** |
-| Bonsai-8B | Q1_0 | 512.0 | 511.9 | -0.02 | 2019.8 | 2019.4 | 2020.5 | 2026.3 | 101.4 | 101.3 | 101.6 | 102.5 | 97.08 | 97.06 | 97.11 | 97.26 | 9.91 | 0.019 | 9.92 | 9.92 | 9.92 | 9.92 | 51617.4 | 51619.2 | 51621.6 | 51631.4 | 253.5 | 253.5 | 253.6 | 253.7 | 5.40 | **1.835** |
-| Bonsai-8B | Q1_0 | 1024.0 | 499.6 | -2.43 | 3853.8 | 3853.4 | 3855.2 | 3859.8 | 102.9 | 102.9 | 103.2 | 103.5 | 98.56 | 98.48 | 98.88 | 99.05 | 9.42 | 0.019 | 9.43 | 9.43 | 9.44 | 9.47 | 52991.4 | 52989.8 | 53006.3 | 53023.5 | 265.7 | 265.7 | 265.8 | 265.9 | 5.44 | **1.732** |
-| Ternary-Bonsai-1.7B | Q2_0 | 256.0 | 128.0 | -0.04 | 337.9 | 337.4 | 338.7 | 344.6 | 42.1 | 42.1 | 42.2 | 42.5 | 38.59 | 38.59 | 38.64 | 38.82 | 24.40 | 0.191 | 24.43 | 24.43 | 24.47 | 24.48 | 5237.5 | 5238.5 | 5242.8 | 5258.3 | 757.6 | 758.8 | 759.5 | 760.0 | 4.74 | **5.146** |
-| Ternary-Bonsai-1.7B | Q2_0 | 512.0 | 128.0 | 0.00 | 602.2 | 600.1 | 601.0 | 634.1 | 42.6 | 42.6 | 42.9 | 43.6 | 39.07 | 39.08 | 39.10 | 39.11 | 22.98 | 0.180 | 23.00 | 23.01 | 23.03 | 23.04 | 5564.6 | 5563.5 | 5566.3 | 5601.0 | 850.3 | 853.2 | 853.7 | 854.3 | 4.74 | **4.852** |
-| Ternary-Bonsai-1.7B | Q2_0 | 1024.0 | 128.0 | -0.04 | 1133.7 | 1130.7 | 1141.8 | 1148.7 | 43.8 | 43.7 | 44.5 | 44.7 | 40.26 | 40.21 | 40.40 | 40.59 | 20.47 | 0.160 | 20.49 | 20.52 | 20.55 | 20.56 | 6244.1 | 6236.5 | 6262.8 | 6294.8 | 903.2 | 905.6 | 906.4 | 906.9 | 4.92 | **4.160** |
-| Ternary-Bonsai-1.7B | Q2_0 | 2048.0 | 128.1 | 0.04 | 2232.8 | 2230.0 | 2232.1 | 2271.9 | 45.9 | 46.0 | 46.1 | 46.4 | 42.51 | 42.53 | 42.56 | 42.57 | 16.76 | 0.131 | 16.77 | 16.77 | 16.78 | 16.88 | 7634.2 | 7632.3 | 7635.6 | 7668.8 | 917.2 | 918.4 | 918.7 | 919.3 | 4.97 | **3.370** |
-| Ternary-Bonsai-1.7B | Q2_0 | 256.0 | 250.4 | -2.19 | 338.2 | 337.5 | 338.9 | 346.0 | 42.1 | 42.1 | 42.3 | 42.8 | 38.62 | 38.62 | 38.64 | 38.72 | 25.09 | 0.100 | 25.11 | 25.13 | 25.16 | 25.17 | 9969.3 | 10183.3 | 10189.2 | 10198.5 | 757.0 | 758.4 | 759.1 | 759.5 | 4.74 | **5.290** |
-| Ternary-Bonsai-1.7B | Q2_0 | 512.0 | 255.9 | -0.04 | 601.7 | 601.1 | 602.4 | 610.0 | 42.5 | 42.6 | 42.9 | 43.1 | 39.17 | 39.17 | 39.21 | 39.40 | 24.15 | 0.094 | 24.17 | 24.17 | 24.20 | 24.24 | 10587.2 | 10590.3 | 10597.9 | 10599.4 | 851.0 | 851.8 | 852.9 | 853.1 | 4.77 | **5.067** |
-| Ternary-Bonsai-1.7B | Q2_0 | 1024.0 | 252.4 | -1.41 | 1131.0 | 1130.6 | 1131.0 | 1137.6 | 43.9 | 43.9 | 44.2 | 44.8 | 40.30 | 40.27 | 40.36 | 40.60 | 22.39 | 0.089 | 22.40 | 22.46 | 22.46 | 22.51 | 11261.9 | 11399.3 | 11412.6 | 11418.2 | 905.4 | 905.8 | 906.1 | 906.2 | 4.78 | **4.680** |
-| Ternary-Bonsai-1.7B | Q2_0 | 2048.0 | 255.9 | -0.02 | 2231.0 | 2230.4 | 2231.8 | 2241.0 | 46.4 | 45.9 | 46.9 | 52.6 | 42.57 | 42.57 | 42.62 | 42.72 | 19.55 | 0.076 | 19.56 | 19.56 | 19.59 | 19.60 | 13083.4 | 13084.8 | 13096.7 | 13115.5 | 918.0 | 918.2 | 918.8 | 919.4 | 4.87 | **4.017** |
-| Ternary-Bonsai-1.7B | Q2_0 | 256.0 | 512.0 | 0.01 | 338.3 | 337.9 | 338.7 | 344.3 | 42.1 | 42.1 | 42.3 | 42.5 | 38.91 | 38.92 | 38.93 | 38.96 | 25.30 | 0.049 | 25.32 | 25.32 | 25.34 | 25.36 | 20223.3 | 20225.2 | 20230.7 | 20244.8 | 756.6 | 757.6 | 758.5 | 759.1 | 4.76 | **5.316** |
-| Ternary-Bonsai-1.7B | Q2_0 | 512.0 | 511.9 | -0.01 | 601.6 | 601.0 | 603.2 | 607.6 | 42.6 | 42.7 | 42.8 | 42.9 | 39.45 | 39.43 | 39.47 | 39.70 | 24.65 | 0.048 | 24.66 | 24.67 | 24.69 | 24.70 | 20757.7 | 20751.4 | 20766.8 | 20878.9 | 851.0 | 851.9 | 852.8 | 852.9 | 4.75 | **5.191** |
-| Ternary-Bonsai-1.7B | Q2_0 | 1024.0 | 504.1 | -1.53 | 1132.0 | 1131.2 | 1133.7 | 1139.0 | 43.9 | 44.0 | 44.2 | 44.2 | 40.56 | 40.57 | 40.60 | 40.65 | 23.39 | 0.046 | 23.40 | 23.42 | 23.45 | 23.49 | 21540.3 | 21864.1 | 21878.0 | 21878.7 | 904.6 | 905.2 | 905.5 | 905.9 | 4.77 | **4.901** |
-| Ternary-Bonsai-1.7B | Q2_0 | 2048.0 | 500.1 | -2.32 | 2230.3 | 2229.7 | 2231.5 | 2236.3 | 45.9 | 45.9 | 46.1 | 46.4 | 42.75 | 42.76 | 42.80 | 42.92 | 21.21 | 0.042 | 21.22 | 21.21 | 21.24 | 21.40 | 23564.9 | 23565.6 | 23580.7 | 23592.9 | 918.3 | 918.5 | 918.7 | 919.0 | 4.79 | **4.429** |
-| Ternary-Bonsai-4B | Q2_0 | 256.0 | 128.0 | -0.04 | 785.5 | 783.0 | 784.2 | 820.8 | 86.0 | 87.4 | 87.6 | 87.7 | 82.61 | 82.60 | 82.62 | 83.07 | 11.34 | 0.089 | 11.35 | 11.35 | 11.36 | 11.37 | 11273.0 | 11273.0 | 11277.0 | 11283.9 | 326.0 | 326.9 | 327.1 | 327.2 | 5.11 | **2.221** |
-| Ternary-Bonsai-4B | Q2_0 | 512.0 | 128.0 | -0.04 | 1400.7 | 1400.0 | 1400.8 | 1409.9 | 88.1 | 88.2 | 88.3 | 88.5 | 83.33 | 83.30 | 83.34 | 83.87 | 10.68 | 0.083 | 10.68 | 10.69 | 10.69 | 10.69 | 11979.5 | 11978.7 | 11982.9 | 11997.5 | 365.5 | 365.7 | 365.8 | 365.9 | 5.08 | **2.103** |
-| Ternary-Bonsai-4B | Q2_0 | 1024.0 | 128.1 | 0.04 | 2660.6 | 2660.2 | 2661.2 | 2666.3 | 89.6 | 89.7 | 89.8 | 90.2 | 84.71 | 84.71 | 84.83 | 84.98 | 9.54 | 0.074 | 9.54 | 9.54 | 9.54 | 9.60 | 13423.3 | 13420.9 | 13433.8 | 13452.2 | 384.9 | 384.9 | 385.0 | 385.0 | 5.13 | **1.859** |
-| Ternary-Bonsai-4B | Q2_0 | 2048.0 | 128.0 | -0.04 | 5276.0 | 5275.5 | 5276.5 | 5284.8 | 92.4 | 92.4 | 92.7 | 93.0 | 87.69 | 87.65 | 87.68 | 88.25 | 7.80 | 0.061 | 7.80 | 7.80 | 7.80 | 7.81 | 16407.9 | 16407.3 | 16410.1 | 16428.0 | 388.2 | 388.2 | 388.3 | 388.3 | 5.22 | **1.493** |
-| Ternary-Bonsai-4B | Q2_0 | 256.0 | 255.8 | -0.08 | 786.6 | 783.6 | 784.9 | 830.7 | 85.9 | 87.3 | 87.4 | 87.5 | 82.61 | 82.55 | 82.87 | 82.88 | 11.71 | 0.046 | 11.72 | 11.72 | 11.73 | 11.74 | 21835.1 | 21833.7 | 21839.8 | 21877.4 | 325.5 | 326.7 | 326.8 | 326.9 | 5.04 | **2.323** |
-| Ternary-Bonsai-4B | Q2_0 | 512.0 | 255.8 | -0.08 | 1401.8 | 1401.0 | 1401.6 | 1414.9 | 88.0 | 88.2 | 88.3 | 88.5 | 83.35 | 83.29 | 83.41 | 83.95 | 11.29 | 0.044 | 11.30 | 11.31 | 11.32 | 11.32 | 22639.8 | 22639.9 | 22652.6 | 22654.0 | 365.2 | 365.5 | 365.6 | 365.6 | 5.08 | **2.226** |
-| Ternary-Bonsai-4B | Q2_0 | 1024.0 | 255.9 | -0.04 | 2662.9 | 2662.3 | 2664.4 | 2669.9 | 89.6 | 89.7 | 89.9 | 89.9 | 84.79 | 84.75 | 85.06 | 85.11 | 10.54 | 0.041 | 10.54 | 10.55 | 10.55 | 10.58 | 24276.0 | 24272.2 | 24285.7 | 24293.7 | 384.5 | 384.6 | 384.8 | 384.8 | 5.09 | **2.070** |
-| Ternary-Bonsai-4B | Q2_0 | 2048.0 | 255.8 | -0.08 | 5280.3 | 5279.8 | 5281.4 | 5288.7 | 92.2 | 92.3 | 92.4 | 92.5 | 87.68 | 87.62 | 87.70 | 88.29 | 9.26 | 0.036 | 9.26 | 9.27 | 9.27 | 9.27 | 27621.4 | 27622.9 | 27634.4 | 27636.6 | 387.9 | 387.9 | 388.0 | 388.1 | 5.14 | **1.801** |
-| Ternary-Bonsai-4B | Q2_0 | 256.0 | 512.0 | 0.00 | 783.9 | 783.5 | 784.2 | 790.8 | 87.2 | 87.3 | 87.3 | 87.4 | 82.89 | 82.89 | 82.94 | 83.05 | 11.87 | 0.023 | 11.87 | 11.87 | 11.87 | 11.91 | 43139.9 | 43140.5 | 43145.8 | 43163.7 | 326.6 | 326.8 | 327.0 | 327.1 | 5.05 | **2.347** |
-| Ternary-Bonsai-4B | Q2_0 | 512.0 | 511.9 | -0.01 | 1401.5 | 1401.0 | 1402.3 | 1407.6 | 88.1 | 88.1 | 88.2 | 88.8 | 83.61 | 83.61 | 83.64 | 83.89 | 11.60 | 0.023 | 11.60 | 11.60 | 11.61 | 11.63 | 44120.8 | 44123.9 | 44133.0 | 44139.2 | 365.3 | 365.5 | 365.6 | 365.7 | 5.05 | **2.296** |
-| Ternary-Bonsai-4B | Q2_0 | 1024.0 | 511.8 | -0.04 | 2665.1 | 2662.0 | 2664.3 | 2709.7 | 88.3 | 89.7 | 89.8 | 89.8 | 85.14 | 85.11 | 85.29 | 85.38 | 11.09 | 0.022 | 11.09 | 11.09 | 11.10 | 11.10 | 46153.4 | 46155.7 | 46175.5 | 46183.6 | 384.2 | 384.7 | 384.8 | 384.9 | 5.07 | **2.186** |
-| Ternary-Bonsai-4B | Q2_0 | 2048.0 | 499.8 | -2.38 | 5280.4 | 5280.1 | 5281.5 | 5287.3 | 92.3 | 92.3 | 92.4 | 93.1 | 87.98 | 87.95 | 88.10 | 88.25 | 10.16 | 0.020 | 10.17 | 10.17 | 10.17 | 10.19 | 49164.7 | 49157.8 | 49187.4 | 49189.7 | 387.9 |a 387.9 | 388.0 | 388.1 | 5.09 | **1.995** |
-| Ternary-Bonsai-8B | Q2_0 | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | OOM |
+
+<a id="appendix-h"></a>
+## Appendix H: ITL: All Combinations
+
+Inter-token latency (ms) = time between consecutive output tokens. It measures decode cost and is driven by model size and GPU clock, not prompt length.
+
+<a id="appendix-h1"></a>
+### H.1 ITL vs prompt length (by gen length)
+
+**Figure H.1a: ITL vs prompt length: gen=128**
+
+<a id="figure-h1a"></a>
+
+![ITL vs prompt gen=128](../../non-reasoning-models/artifacts/charts/EH_itl_vs_prompt_gen128.png)
+
+**Figure H.1b: ITL vs prompt length: gen=256**
+
+<a id="figure-h1b"></a>
+
+![ITL vs prompt gen=256](../../non-reasoning-models/artifacts/charts/EH_itl_vs_prompt_gen256.png)
+
+**Figure H.1c: ITL vs prompt length: gen=512** *(canonical, also in section 2.3)*
+
+<a id="figure-h1c"></a>
+
+![ITL vs prompt gen=512](../../non-reasoning-models/artifacts/charts/EH_itl_vs_prompt_gen512.png)
+
+
 
 ---
 
-## Appendix B — Thermal & Power Summary (15W Run)
+<a id="appendix-h2"></a>
+### H.2 ITL heatmaps (gen x prompt) per power mode
 
-| Model | Quant | Avg Power (W) | Peak TJ (°C) | Status |
-|-------|-------|---:|---:|:---:|
-| Bonsai-1.7B | Q1_0 | 2.55 | 59.0 | OK |
-| Bonsai-4B | Q1_0 | 3.68 | 61.7 | OK |
-| Bonsai-8B | Q1_0 | 5.32 | 64.1 | OK |
-| Ternary-Bonsai-1.7B | Q2_0 | 4.56 | 63.8 | OK |
-| Ternary-Bonsai-4B | Q2_0 | 5.02 | 63.2 | OK |
-| Ternary-Bonsai-8B | Q2_0 | — | — | OOM |
+<table>
+<tr>
+<td align="center">
+  <a id="figure-h2a"></a>
+  <strong>Figure H.2a: ITL heatmap: 7W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EH_itl_heatmap_7w.png" width="100%">
+</td>
+<td align="center">
+  <a id="figure-h2b"></a>
+  <strong>Figure H.2b: ITL heatmap: 15W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EH_itl_heatmap_15w.png" width="100%">
+</td>
+</tr>
+<tr>
+<td align="center">
+  <a id="figure-h2c"></a>
+  <strong>Figure H.2c: ITL heatmap: 25W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EH_itl_heatmap_25w.png" width="100%">
+</td>
+<td align="center">
+  <a id="figure-h2d"></a>
+  <strong>Figure H.2d: ITL heatmap: MAXN</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EH_itl_heatmap_maxn.png" width="100%">
+</td>
+</tr>
+</table>
 
-> "Avg Power" is the model-level window average (includes server startup/shutdown time) — lower than the per-run values in Appendix A. No model triggered thermal throttling (threshold ≈ 95 °C).
+
+
+<a id="appendix-i"></a>
+## Appendix I: Prefill Throughput: All Combinations
+
+Prefill throughput (tok/s) measures how fast the model processes input tokens. It scales with prompt length (longer prompts hit peak GPU utilisation) and GPU clock speed.
+
+<a id="appendix-i1"></a>
+### I.1 Prefill throughput vs prompt length (by gen length)
+
+**Figure I.1a: Prefill throughput vs prompt length: gen=128**
+
+<a id="figure-i1a"></a>
+
+![Prefill tput vs prompt gen=128](../../non-reasoning-models/artifacts/charts/EI_prefill_tput_vs_prompt_gen128.png)
+
+**Figure I.1b: Prefill throughput vs prompt length: gen=256** *(canonical, also in section 2.4)*
+
+![Prefill tput vs prompt gen=256](../../non-reasoning-models/artifacts/charts/EI_prefill_tput_vs_prompt_gen256.png)
+
+*Prefill throughput is independent of gen length, so gen=128 and gen=256 show the same trend.*
+
+
+
+<a id="appendix-i2"></a>
+### I.2 Prefill throughput heatmaps (gen x prompt) per power mode
+
+<table>
+<tr>
+<td align="center">
+  <a id="figure-i2a"></a>
+  <strong>Figure I.2a: Prefill throughput heatmap: 7W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EI_prefill_tput_heatmap_7w.png" width="100%">
+</td>
+<td align="center">
+  <a id="figure-i2b"></a>
+  <strong>Figure I.2b: Prefill throughput heatmap: 15W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EI_prefill_tput_heatmap_15w.png" width="100%">
+</td>
+</tr>
+<tr>
+<td align="center">
+  <a id="figure-i2c"></a>
+  <strong>Figure I.2c: Prefill throughput heatmap: 25W</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EI_prefill_tput_heatmap_25w.png" width="100%">
+</td>
+<td align="center">
+  <a id="figure-i2d"></a>
+  <strong>Figure I.2d: Prefill throughput heatmap: MAXN</strong><br>
+  <img src="../../non-reasoning-models/artifacts/charts/EI_prefill_tput_heatmap_maxn.png" width="100%">
+</td>
+</tr>
+</table>
+
+
+
+<a id="appendix-j"></a>
+## Appendix J: All Metrics, Formulas, and Calculation Methods
+
+This appendix documents every metric reported in this benchmark, its formula, its source, and any caveats.
+
+
+
+<a id="glossary"></a>
+<a id="appendix-j1"></a>
+<a id="glossary"></a>
+### J.1 Raw inputs from aiperf and tegrastats
+
+| Symbol | Source | Definition |
+|--------|--------|------------|
+| `ISL` | aiperf JSON `input_sequence_length.avg` | Actual input tokens processed per request (may differ from target due to tokenizer rounding) |
+| `OSL` | aiperf JSON `output_sequence_length.avg` | Actual output tokens generated per request |
+| `TTFT` | aiperf JSON `time_to_first_token.p50` (ms) | Median time from request sent to first output token received; proxy for prefill duration. p50 used (not avg) to avoid skew from occasional slow requests |
+| `ITL` | aiperf JSON `inter_token_latency.p50` (ms) | Median time between consecutive output tokens; per-token decode cost. p50 used for robustness against outliers |
+| `RL` | aiperf JSON `request_latency.p50` (ms) | Median total wall time per request: TTFT + all inter-token intervals. p50 used for energy calculations |
+| `tok_s` | aiperf JSON `output_token_throughput_per_user.avg` | Output tokens per second, single-user (OSL / RL in steady state) |
+| `prefill_tput` | aiperf JSON `prefill_throughput_per_user.avg` | Input tokens processed per second during prefill phase |
+| `t0`, `t1` | aiperf JSON `start_time`, `end_time` (ISO 8601) | Wall-clock start and end of the full 20-request profiling run |
+| `mW_i` | tegrastats `VDD_CPU_GPU_CV` field (mW) | Instantaneous power on the CPU+GPU+CV rail at sample `i` |
+
+All aiperf metrics are averages over 20 requests per combo. Percentile variants (p50, p90, p99) are also available in the raw JSON but not reproduced here.
 
 ---
 
-## Appendix C — Caveats & Notes
+<a id="appendix-j2"></a>
+### J.2 Power
 
-- **Power modes:** Appendices A–B use the 15W run (`bonsai-all-20260525-0243`). Full MAXN data: `report_max.md` (`bonsai-all-20260526-0239`). Both runs used the same sweep parameters and 20 requests/combo.
-- **Concurrency:** Single-user (concurrency = 1). Multi-user throughput characteristics not captured.
-- **Tokenizer:** Size-matched Qwen3 tokenizers used for aiperf synthetic prompt generation.
-- **`--no-cache-prompt`:** Disabled llama-server prompt-state pooling; each request starts from a clean KV state.
-- **`--reasoning off`:** Qwen3 chain-of-thought disabled at server level for deterministic output length.
-- **Ternary-Bonsai-8B OOM:** JetPack R36.4.7 NvMap regression. Fix: clean reflash to L4T 36.5 (JetPack 6.2.2).
-- **Bonsai-8B context cap:** `-c 1536` to stay within memory budget; ctx=2048 prompts excluded by design.
-- **aiperf JSON:** `output_token_throughput` and `request_throughput` are avg-only. All other metrics include p50/p90/p99/min/max/std.
+```
+avg_power_W = mean(mW_i for all tegrastats samples where t0 <= sample_time <= t1) / 1000
+```
+
+- `VDD_CPU_GPU_CV` covers the CPU, GPU, and Computer Vision engine rail
+- Does NOT include board overhead (fan, storage, USB) which is on `VDD_IN`
+- `VDD_IN` is ~1.5-3 W higher than `VDD_CPU_GPU_CV` during inference
+- Tegrastats interval: 500 ms
+
+---
+
+<a id="appendix-j3"></a>
+### J.3 Output tok/J (main efficiency metric)
+
+```
+output_tok_J = OSL / (avg_power_W * (RL_p50_s - TTFT_p50_s))
+             = OSL / decode_J
+```
+
+Where `RL_s = RL / 1000`, `TTFT_s = TTFT / 1000` (in seconds). The denominator is the decode-phase energy only — prefill is excluded because no output tokens are generated during prefill.
+
+Higher is better. This measures how many output tokens are generated per joule of generation energy. It is the primary metric of the benchmark.
+
+**Note:** because decode time is nearly independent of prompt length (it depends only on model size, GPU clock, and gen length), output tok/J is also roughly independent of prompt length. Carries the same approximation caveat as J.5 for cells where decode_J is very small.
+
+---
+
+<a id="appendix-j4"></a>
+### J.4 Request latency energy
+
+```
+total_J = avg_power_W * (RL / 1000)
+```
+
+Energy consumed by one average request from first byte sent to last token received. Accurate for all cells regardless of TTFT.
+
+---
+
+<a id="appendix-j5"></a>
+### J.5 Prefill and decode energy
+
+```
+prefill_J  = avg_power_W * (TTFT / 1000)
+decode_J   = avg_power_W * ((RL - TTFT) / 1000)
+           = total_J - prefill_J
+
+prefill_%  = prefill_J / total_J * 100
+```
+
+**Approximation:** `prefill_J = avg_power_W × TTFT_s`, where `avg_power_W` is the mean over the *entire* aiperf run window — all 20 requests, every tegrastats sample from `t0` to `t1`. Each 500 ms tegrastats sample spans across whatever mix of prefill and decode phases happened to be running at that clock tick; there is no way to assign a sample exclusively to prefill or decode. The result is a single power number for the whole cell, and we use it as a proxy for both phases.
+
+**This is a reasonable approximation for Bonsai models** because they are memory-bandwidth bound — prefill (loading weights + building KV cache) and decode (loading weights + reading KV cache) are both DRAM-heavy and draw similar power. For compute-bound models it would not hold, since prefill is matrix-multiply-heavy and spikes well above decode power.
+
+All other metrics (`output_tok_J`, `decode_J`, `total_tok_J`) share the same `avg_power_W` proxy and carry the same approximation.
+
+---
+
+<a id="appendix-j6"></a>
+### J.6 Phase tok/J metrics
+
+```
+prefill_tok_J = ISL / prefill_J
+              = ISL / (avg_power_W * TTFT_s)
+
+decode_tok_J  = OSL / decode_J
+              = OSL / (avg_power_W * (RL_s - TTFT_s))
+
+total_tok_J   = (ISL + OSL) / total_J
+              = (ISL + OSL) / (avg_power_W * RL_s)
+```
+
+Where `TTFT_s = TTFT / 1000`, `RL_s = RL / 1000`.
+
+- `prefill_tok_J`: input tokens processed per joule of prefill energy. **Unreliable for 16 % of cells (TTFT < 500 ms, zero tegrastats samples); rough for a further 21 % (~1 sample). See J.5 for full breakdown.**
+- `decode_tok_J`: identical to `output_tok_J` — the primary benchmark metric. Reasonably accurate for all cells.
+- `total_tok_J`: all tokens (in + out) per joule of total request energy. Always accurate.
+
+---
+
+<a id="appendix-j7"></a>
+### J.7 mJ per output token
+
+```
+mJ_per_output_tok = (decode_J / OSL) * 1000
+                  = 1000 / decode_tok_J
+```
+
+Millijoules per generated output token (`decode_J` is in joules, ×1000 converts to mJ for readability). Carries the same caveat as J.5 for cells where TTFT < 500 ms.
+
+---
+
+<a id="appendix-j8"></a>
+### J.8 Prefill throughput
+
+```
+prefill_tput (tok/s) = aiperf JSON prefill_throughput_per_user.avg
+```
+
+Directly from aiperf. Measures how fast input tokens are processed during the prefill phase. Scales with prompt length (longer prompts hit peak GPU utilisation) and GPU clock.
+
+---
+
+<a id="appendix-j9"></a>
+### J.9 Throughput speedup ratios (Table 9)
+
+```
+speedup_25W_vs_15W  = mean(tok_s_25W  over all 12 combos) / mean(tok_s_15W  over all 12 combos)
+speedup_MAXN_vs_15W = mean(tok_s_MAXN over all 12 combos) / mean(tok_s_15W  over all 12 combos)
+speedup_15W_vs_7W   = mean(tok_s_15W  over all 12 combos) / mean(tok_s_7W   over all 12 combos)
+```
+
+Averages are over all 4 prompt lengths × 3 gen lengths = 12 combos. `tok_s` = `output_token_throughput_per_user.avg` (aiperf); no p50 is available for throughput. Latency speedup ratios (Tables 10a, 11, 12) use mean of p50 values instead.
+
+---
+
+<a id="appendix-j10"></a>
+### J.10 Best total tok/J per model (Table 13)
+
+```
+best_total_tok_J(model) = max(total_tok_J(mode, model, gen, ctx))
+                          over all modes in {7W, 15W, 25W, MAXN}
+                          and all gen in {128, 256, 512}
+                          and all ctx in {256, 512, 1024, 2048}
+
+total_tok_J = (ISL + OSL) / (avg_power_W * RL_p50_s)
+```
+
+The single highest total tok/J value observed for that model across all 48 combinations. Peaks at ctx=2048, gen=128 for every model because the long prompt dominates the (ISL + OSL) numerator.
+
+---
+
+<a id="appendix-j11"></a>
+### J.11 TTFT, ITL, RL percentiles
+
+All percentile variants come directly from aiperf JSON without further computation:
+
+```
+TTFT       = time_to_first_token.p50   (canonical; p50 used everywhere)
+TTFT_p90   = time_to_first_token.p90
+TTFT_p99   = time_to_first_token.p99
+ITL        = inter_token_latency.p50    (canonical; p50 used everywhere)
+ITL_p99    = inter_token_latency.p99
+RL         = request_latency.p50        (canonical; p50 used everywhere)
+RL_p99     = request_latency.p99
+```
+
+---
+
+<a id="appendix-j12"></a>
+### J.12 Energy caveat: which metrics are accurate vs approximate
+
+| Metric | Accurate? | Condition |
+|--------|-----------|-----------|
+| `output_tok_J` | Always | No phase split needed |
+| `total_J` | Always | Full window power * RL |
+| `decode_J` | Mostly | avg_power approx decode power since decode dominates window |
+| `decode_tok_J` | Mostly | Same as above |
+| `total_tok_J` | Always | Uses total_J which is accurate |
+| `prefill_J` | TTFT >= 500 ms only | Needs tegrastats sample in prefill window |
+| `prefill_tok_J` | TTFT >= 500 ms only | Derived from prefill_J |
+| `prefill_%` | TTFT >= 500 ms only | Derived from prefill_J |
+| `mJ_per_output_tok` | Mostly | Derived from decode_J |
+
+All metrics that use `prefill_J` or `decode_J` share the same approximation: `avg_power_W` is a full-run average that cannot be decomposed into prefill-phase vs decode-phase power (see J.5). For Bonsai models (memory-bandwidth bound, similar power across phases) this is a reasonable proxy. `output_tok_J` is computable for 239 of 240 cells; the one exception (Bonsai-8B / 25W / ctx=256 / gen=512) is a complete benchmark failure — all 20 aiperf requests errored — unrelated to power measurement.
+
+---
+
+<a id="appendix-j13"></a>
+### J.13 Power and temperature
+
+```
+avg_power_W = mean(tegrastats.VDD_CPU_GPU_CV[mW] / 1000
+              for all samples where aiperf_t0 <= sample_time <= aiperf_t1)
+```
+
+Power is the **mean VDD_CPU_GPU_CV** (CPU+GPU+CV rail) from `tegrastats` sampled at 500 ms intervals, averaged over each model's active inference windows only (idle/cool-down between models excluded).
+
+**Junction temperature (TJ)** is the hottest internal die temperature on the Jetson SoC, reported by `tegrastats` as `tj@`. The hardware automatically throttles GPU/CPU clocks when TJ reaches ~95 °C to prevent damage. Peak TJ < 76 °C across all runs confirms ample thermal headroom at every power mode.
+
+| Symbol | Source | Definition |
+|--------|--------|------------|
+| `VDD_CPU_GPU_CV` | tegrastats | Instantaneous power (mW) on the CPU+GPU+CV rail |
+| `cpu@` | tegrastats | CPU cluster temperature (°C) |
+| `gpu@` | tegrastats | GPU temperature (°C) |
+| `tj@` | tegrastats | Junction (hottest internal die) temperature (°C) |
+| `avg_power_W` | computed | Mean VDD_CPU_GPU_CV over active inference window (W) |
+| `avg_cpu_C` | computed | Mean CPU temp over active inference window |
+| `avg_gpu_C` | computed | Mean GPU temp over active inference window |
+| `peak_tj_C` | computed | Maximum TJ temperature observed |
+
+Throttling is flagged when `peak_tj_C > 85 °C` (leaving a 10 °C safety margin below the hardware limit).

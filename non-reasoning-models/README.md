@@ -20,9 +20,12 @@ Published report: [benchmark_report.md](./benchmark_report.md)
 - [Running Benchmarks](#running-benchmarks)
 - [Output](#output)
 - [Generating Charts and Reports](#generating-charts-and-reports)
-- [Flags Reference](#flags-reference)
+- [Arguments](#arguments)
 
 
+## Report
+
+To get a detailed report of the benchmark with full experiments and analysis, you can get it [here](https://www.smolhub.com/posts/jetson-nano-super-benchmark-non-reasoning/)`
 
 ## Hardware
 
@@ -193,16 +196,111 @@ artifacts/blog-all-YYYYMMDD-HHMM-<mode>/
 
 
 
-## Flags Reference
+## Arguments
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--backend <b>` | `llamacpp` | `llamacpp` \| `ollama` \| `both` |
-| `--power-mode N` | `0` | 0=15W · 1=25W · 2=MAXN · 3=7W |
-| `--reqs N` | `20` | Requests per benchmark combo |
-| `--only <name>` | — | Single model filter (substring match) |
-| `--skip-smoke` | — | Skip smoke test before each model |
-| `--dry-run` | — | Print plan without benchmarking |
-| `--resume <dir>` | — | Resume from an existing artifact dir |
+```
+bash bench-non-reasoning.sh [OPTIONS]
+```
+
+---
+
+#### `--backend <llamacpp|ollama|both>`
+
+- **Optional**
+- **Default:** `llamacpp`
+
+Inference backend to use.
+
+| Value | Behaviour |
+|-------|-----------|
+| `llamacpp` | Launches `llama-server` directly. Binary expected at `~/llama.cpp/build/bin/llama-server`; override with `LLAMACPP_BIN=/path/to/llama-server`. |
+| `ollama` | Expects the Ollama daemon to be running. Imports each GGUF from `~/gguf-models/` via a generated Modelfile. |
+| `both` | Runs the full llama.cpp sweep first, then Ollama. Results land in separate `llamacpp/` and `ollama/` subdirectories inside the same artifact directory. |
+
+---
+
+#### `--power-mode <N>`
+
+- **Optional**
+- **Default:** `0`
+
+Sets the Jetson nvpmodel power envelope before the run starts via `sudo nvpmodel -m N`.
+
+| N | Mode |
+|---|------|
+| 0 | 15W |
+| 1 | 25W |
+| 2 | MAXN |
+| 3 | 7W |
+
+**Note:** This argument is not saved to disk and is not read back from the artifact directory on `--resume`. If you resume a run without passing `--power-mode`, the hardware will be set to `0` (15W) regardless of what mode the original run used. Always pass the same value you used for the original run.
+
+Switching to or from 7W requires a reboot. The script detects this and exits with instructions rather than benchmarking at the wrong mode.
+
+Shorthand alias: `--maxn` is equivalent to `--power-mode 2`.
+
+---
+
+#### `--reqs <N>`
+
+- **Optional**
+- **Default:** `20`
+
+Number of requests per benchmark combo (prompt_len × gen_len cell). Higher values reduce variance; `20` is the default and the value used for published results.
+
+---
+
+#### `--only <model-name>`
+
+- **Optional**
+- **Default:** all models
+
+Run a single model instead of the full sweep. The value is matched as a case-insensitive substring against the model name. Valid values: `smollm2-135m`, `smollm2-360m`, `qwen2.5-0.5b`, `qwen3-0.6b`, `llama3.2-1b`, `gemma3-1b`, `gemma3-4b`, `lfm2.5-350m`, `lfm2.5-1.2b`.
+
+Combine with `--resume` to patch a single missing or failed model into an existing run.
+
+---
+
+#### `--resume <dir>`
+
+- **Optional**
+- **Default:** none (creates a new timestamped artifact directory)
+
+Reuse an existing artifact directory instead of creating a new one. The script inspects which prompt_len × gen_len combos already have result files (`profile_export_aiperf.json`) for each model and skips them. Only missing combos are benchmarked.
+
+**Required companion argument:** always pass `--power-mode` with the same value used for the original run. The script does not store or recover the original power mode automatically.
+
+```bash
+# Resume an interrupted 25W run
+bash bench-non-reasoning.sh \
+  --resume artifacts/blog-all-YYYYMMDD-HHMM-25w \
+  --power-mode 1
+
+# Rerun only one missing model in an existing run
+bash bench-non-reasoning.sh \
+  --only smollm2-135m \
+  --resume artifacts/blog-all-YYYYMMDD-HHMM-25w \
+  --power-mode 1
+```
+
+---
+
+#### `--skip-smoke`
+
+- **Optional** — flag, no value
+- **Default:** off
+
+Skip the smoke test (short generation) that runs before each model's benchmark sweep. The smoke test verifies the server loaded and responds correctly; skipping it saves time but removes the early-failure safety net.
+
+---
+
+#### `--dry-run`
+
+- **Optional** — flag, no value
+- **Default:** off
+
+Print the full list of models and combos that would run without executing anything. Useful for verifying `--only` / `--resume` filtering before starting a long run.
+
+---
 
 > **CMA note:** At 7W, Jetson CMA address space fragments after sequential model loads. The script calls `/proc/sys/vm/compact_memory` between models; a reboot may still be needed before running 7W after other modes. nvpmodel itself requires a reboot when switching to or from 7W — the script detects this and exits with instructions rather than benchmarking at the wrong mode.

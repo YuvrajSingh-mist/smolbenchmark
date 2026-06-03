@@ -11,6 +11,7 @@ Throughput and energy-efficiency benchmarks for the Bonsai and Ternary-Bonsai mo
 - [Metrics](#metrics)
 - [Installation & Setup](#installation--setup)
 - [Running Benchmarks](#running-benchmarks)
+  - [Arguments](#arguments)
 - [Output](#output)
 - [Generating Reports](#generating-reports)
 
@@ -105,55 +106,134 @@ cd benchmark-jetson/bonsai-models
 
 All commands assume you are in `benchmark-jetson/bonsai-models/`.
 
-### Full run (default: MAXN_SUPER)
-
-```bash
-bash benchmark_all_bonsai.sh --reqs 20
+```
+bash benchmark_all_bonsai.sh [OPTIONS]
 ```
 
-### Specific power mode
+### Arguments
+
+---
+
+#### `--backend <llamacpp|ollama>`
+
+- **Optional**
+- **Default:** `llamacpp`
+
+Inference backend to use. `llamacpp` launches a `llama-server` process directly. `ollama` expects the Ollama daemon to be running and uses its OpenAI-compatible endpoint.
+
+---
+
+#### `--power-mode <N>`
+
+- **Optional**
+- **Default:** `2`
+
+Sets the Jetson nvpmodel power envelope before the run starts. The script calls `sudo nvpmodel -m N` at startup.
+
+| N | Mode |
+|---|---|
+| 0 | 15W |
+| 1 | 25W |
+| 2 | MAXN_SUPER |
+| 3 | 7W |
+
+**Note:** This argument is not saved to disk and is not read back from the artifact directory on `--resume`. If you resume a run without passing `--power-mode`, the hardware will be set to `2` (MAXN_SUPER) regardless of what mode the original run used. Always pass the same value you used for the original run.
+
+---
+
+#### `--reqs <N>`
+
+- **Optional**
+- **Default:** `20`
+
+Number of requests per benchmark combo (prompt_len × gen_len cell).
+
+---
+
+#### `--only <model-name>`
+
+- **Optional**
+- **Default:** all models
+
+Run a single model instead of the full sweep. The value is matched as a case-insensitive substring against the model name. Valid values: `Bonsai-1.7B`, `Bonsai-4B`, `Bonsai-8B`, `Ternary-Bonsai-1.7B`, `Ternary-Bonsai-4B`, `Ternary-Bonsai-8B`.
+
+Useful for quick tests or to rerun a single model that failed in a previous run (combine with `--resume`).
+
+---
+
+#### `--resume <dir>`
+
+- **Optional**
+- **Default:** none (creates a new timestamped artifact directory)
+
+Reuse an existing artifact directory instead of creating a new one. The script inspects which prompt_len × gen_len combos already have result files for each model and skips them. Only missing combos are benchmarked.
+
+Also implies `--skip-download`.
+
+**Required companion argument:** always pass `--power-mode` with the same value used for the original run. The script does not store or recover the original power mode automatically.
 
 ```bash
-# 0 = 15W  |  1 = 25W  |  2 = MAXN_SUPER  |  3 = 7W
-bash benchmark_all_bonsai.sh --power-mode 0 --reqs 20   # 15W
-bash benchmark_all_bonsai.sh --power-mode 1 --reqs 20   # 25W
-bash benchmark_all_bonsai.sh --power-mode 2 --reqs 20   # MAXN_SUPER
-bash benchmark_all_bonsai.sh --power-mode 3 --reqs 20   # 7W
+# Resume a 25W run
+bash benchmark_all_bonsai.sh \
+  --resume artifacts/llamacpp/bonsai-all-YYYYMMDD-HHMM \
+  --power-mode 1 \
+  --reqs 20
+
+# Rerun only one missing model in an existing run
+bash benchmark_all_bonsai.sh \
+  --only Ternary-Bonsai-4B \
+  --resume artifacts/llamacpp/bonsai-all-YYYYMMDD-HHMM \
+  --power-mode 1
 ```
 
-### Single model (quick test)
-
-```bash
-bash benchmark_all_bonsai.sh --only bonsai-1.7b --reqs 5
-```
-
-### Resume an interrupted run
-
-Always resume inside tmux so the session survives terminal disconnects:
+Always run inside tmux when resuming so the session survives disconnects:
 
 ```bash
 tmux new-session -d -s bonsai-bench && \
-tmux send-keys -t bonsai-bench "cd ~/Desktop/benchmark-jetson/bonsai-models && \
-bash benchmark_all_bonsai.sh --resume artifacts/bonsai-all-YYYYMMDD-HHMM --power-mode 3 --reqs 20" Enter && \
+tmux send-keys -t bonsai-bench "cd ~/Desktop/smolbenchmark/bonsai-models && \
+bash benchmark_all_bonsai.sh --resume artifacts/llamacpp/bonsai-all-YYYYMMDD-HHMM --power-mode 1 --reqs 20" Enter && \
 tmux attach -t bonsai-bench
 ```
 
-Replace `bonsai-all-YYYYMMDD-HHMM` with the actual artifact folder name. The script detects already-completed combos and skips them automatically.
-
 Detach: `Ctrl+B D` — reattach: `tmux attach -t bonsai-bench`
 
-### Flags reference
+---
 
-| Flag | Default | Description |
-|---|---|---|
-| `--power-mode N` | `2` | nvpmodel mode (0=15W, 1=25W, 2=MAXN, 3=7W) |
-| `--reqs N` | `10` | Requests per benchmark run |
-| `--only <name>` | — | Run a single model (partial match) |
-| `--resume <dir>` | — | Resume from existing artifact dir, skip completed combos |
-| `--skip-download` | — | Skip HuggingFace model download check |
-| `--skip-smoke` | — | Skip smoke test before each model |
-| `--no-lock-clocks` | — | Skip `jetson_clocks` (allow DVFS scaling) |
-| `--dry-run` | — | Print what would run, no benchmark |
+#### `--skip-download`
+
+- **Optional** — flag, no value
+- **Default:** off
+
+Skip the HuggingFace model download check. Use when models are already present at the expected paths and you want to avoid the network round-trip. Implied by `--resume`.
+
+---
+
+#### `--skip-smoke`
+
+- **Optional** — flag, no value
+- **Default:** off
+
+Skip the smoke test (short 32/256/512 token generation) that runs before each model's benchmark sweep. The smoke test is a sanity check that the server loaded correctly; skipping it saves ~2 minutes per model but removes the early-failure safety net.
+
+---
+
+#### `--no-lock-clocks`
+
+- **Optional** — flag, no value
+- **Default:** off (clocks are locked)
+
+By default the script calls `jetson_clocks` to lock CPU/GPU clocks at their maximum frequency, eliminating DVFS noise from benchmark results. Pass this flag to allow the OS to scale clocks freely (not recommended for reproducible results).
+
+---
+
+#### `--dry-run`
+
+- **Optional** — flag, no value
+- **Default:** off
+
+Print the full list of models and combos that would run without executing anything. Useful for verifying `--only` / `--resume` filtering before starting a long run.
+
+---
 
 > **Memory note:** On 8GB Orin, load the 8B model first after a fresh reboot. Physical memory fragments after ~30 min of activity, making the 1 GB contiguous allocation for 8B models fail. The script handles this by ordering 8B first.
 
@@ -164,7 +244,7 @@ Detach: `Ctrl+B D` — reattach: `tmux attach -t bonsai-bench`
 Each run creates a timestamped directory under `artifacts/`:
 
 ```
-artifacts/bonsai-all-YYYYMMDD-HHMM/
+artifacts/llamacpp/bonsai-all-YYYYMMDD-HHMM/
 ├── tegrastats.log               # raw power + thermal samples (500ms interval)
 ├── model_timing.log             # per-model start/end epochs for power windowing
 ├── <ModelName>-server.log       # llama-server stdout per model
@@ -182,8 +262,8 @@ artifacts/bonsai-all-YYYYMMDD-HHMM/
 ### Per-run report
 
 ```bash
-python3 gen_report.py --artifact bonsai-all-20260527-0200 --label "25W"
-# writes artifacts/bonsai-all-20260527-0200/report.md
+python3 gen_report.py --artifact llamacpp/bonsai-all-20260527-0200-25W --label "25W"
+# writes artifacts/llamacpp/bonsai-all-20260527-0200-25W/report.md
 ```
 
 ### Combined charts (multi-run comparison)
